@@ -1,0 +1,49 @@
+project:
+  type: book
+
+book:
+  title: "Geospatial Disparities: A Case Study on Real Estate Prices in Paris"
+  author:
+  - name: Agathe Fernandes Machado
+    orcid: 0009-0002-9743-9708
+    affiliations: 
+      - name: Université du Québec à Montréal
+  - name: Arthur Charpentier
+    orcid: 0000-0003-3654-6286
+    affiliations: 
+      - name: Université du Québec à Montréal
+  - name: Ewen Gallic
+    orcid: 0000-0003-3740-2620
+    affiliations:
+      - name: Aix-Marseille School of Economics, Aix-Marseille Univ.
+  - name: François Hue
+    orcid: 0009-0000-6093-6175
+    affiliations: 
+      - name: Université du Québec à Montréal
+  - name: Philipp Ratz
+    orcid: 0000-0002-0966-5493
+    affiliations: 
+      - name: Université du Québec à Montréal
+  date: "1/22/2024"
+  chapters:
+    - index.qmd
+    - data.qmd
+    - neigh-smoothing.qmd
+    - model-calibration.qmd
+    - fairness.qmd
+    - mitigation.qmd
+    - references.qmd
+
+bibliography: ./biblio.bib
+
+fig-cap-location: top
+
+format:
+  html:
+    theme: litera
+    html-math-method: mathjax
+    include-in-header:
+    - file: mathjax-color.html
+
+editor: source
+

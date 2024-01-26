@@ -1,0 +1,34 @@
+# Introduction {.unnumbered}
+
+This ebook provides the replication codes to the article titled _'Geospatial Disparities: A Case Study on Real Estate Prices in Paris.'_
+
+The ebook is divided in 5 chapters. In [Chapter -@sec-data], we present the datasets used in the article along with some descriptive statistics. In [Chapter -@sec-neighborhood-based-smoothing], we show are we can proceed to spatially smooth geospatial data. In [Chapter -@sec-model-calibration], we present how to visualize the calibration and how to compute the expected calibration error. In [Chapter -@sec-fairness], we show spatial disparities in terms of fairness. Lastly, in [Chapter -@sec-mitigation], we present strategies to mitigate the biases highlighted in the previous chapters.
+
+
+::: {.callout-note}
+
+All the codes are written in R, except those used to mitigate the biases ([Chapter -@sec-mitigation]), which are written in python.
+
+
+:::
+
+## Abstract of the Article
+
+Driven by an increasing prevalence of trackers, ever more IoT sensors, and the declining cost of computing power, geospatial information has come to play a pivotal role in contemporary predictive models. While enhancing prognostic performance, geospatial data also has the potential to perpetuate many historical socio-economic patterns, raising concerns about a resurgence of biases and exclusionary practices and their disproportionate impacts on society. Addressing this, our paper emphasizes the crucial need to identify and rectify such biases and calibration errors in predictive models, particularly as algorithms become more intricate and less interpretable. The increasing granularity of geospatial information further introduces ethical concerns, as choosing different geographical scales may exacerbate disparities akin to redlining and exclusionary zoning. To address these issues, we propose a toolkit for identifying and mitigating biases arising from geospatial data. Extending classical fairness definitions, we incorporate an ordinal regression case with spatial attributes, deviating from the binary classification focus. This extension allows us to gauge disparities stemming from data aggregation levels and advocates for a less interfering correction approach. Illustrating our methodology using a Parisian real estate dataset, we showcase practical applications and scrutinize the implications of choosing geographical aggregation levels for fairness and calibration measures.
+
+**Keywords**: Artificial intelligence, Machine learning, Geospatial Data, Fairness, Calibration
+
+
+::: {.callout-warning}
+
+## Disclaimer
+
+We were kindly provided with estimate price and selling price on the Parisian real-estate market.
+
+The data utilized in this study are sourced from [Meilleurs Agents](https://www.meilleursagents.com/), a French Real Estate platform that produces data on the residential market and operates a free online automatic valuation model (AVM).
+
+It is imperative to underscore that the primary objective of this paper is not to scrutinize the inherent biases or calibration of the predictive model employed by the company. Based on our analysis, the company's model appears to be well calibrated.
+
+Our focus is on investigating biases that may arise from geospatial data and the potential socio-economic implications of these biases. We specifically introduce sensitive attributes related to geographical regions as part of our fairness analysis. This illustrative case involving a Parisian real estate dataset serves as a practical example to demonstrate our methodology.
+
+:::

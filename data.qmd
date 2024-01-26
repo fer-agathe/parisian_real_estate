@@ -1,0 +1,407 @@
+# Data {#sec-data}
+
+```{r setup, message=FALSE, warning=FALSE}
+#| code-fold: true
+#| code-summary: Display the setting codes
+
+# Required packages----
+library(tidyverse)
+library(lubridate)
+library(gtsummary)
+library(labelled)
+library(sf)
+library(showtext)
+library(extrafont)
+library(wesanderson)
+
+# Graphs----
+font_main = font_title = 'Times New Roman'
+extrafont::loadfonts(quiet = T)
+face_text='plain'
+face_title='plain'
+size_title = 14
+size_text = 11
+legend_size = 11
+
+global_theme <- function() {
+  theme_minimal() %+replace%
+    theme(
+      text = element_text(family = font_main, size = size_text, face = face_text),
+      legend.text = element_text(family = font_main, size = legend_size),
+      axis.text = element_text(size = size_text, face = face_text), 
+      plot.title = element_text(
+        family = font_title, 
+        size = size_title, 
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+# Colours
+colors_ <- wes_palette('Rushmore1')
+col_seine <- "#2140A3"
+```
+
+
+## Source
+
+The data come from _Meilleurs Agents_, a French Real Estate platform that produces data on the residential market and operates a free online automatic valuation model (AVM).
+
+```{r load-data}
+load("../data/raw/base_immo.RData")
+```
+
+## Global Summary Statistics {#sec-data-stat-desc}
+
+
+We have access to both the estimated price $\hat{Z}$ of the underlying property and realized net sale price $Z$. We also have access to the approximate location and amount of square meters ($m^2$) of the property.
+
+
+We restrict our observations to cases where all the information is available.
+```{r}
+data_immo_all <- 
+  base_finale |> 
+  as_tibble() |> 
+  mutate(CODE_IRIS = as.character(iris_cog)) |> 
+  mutate(difference_total = contract_final_net_price - backtest_estima) |> 
+  mutate(pm2_estimated = backtest_estima/arrea_carrez) |> 
+  mutate(difference_pm2 = pm2 - pm2_estimated) |> 
+  select(-c(X))
+nrow(data_immo_all)
+```
+
+
+There are `r scales::number(nrow(data_immo_all), big.mark = ",")`  observation in the dataset. Let us have a look at the number of observations depending on the city. The dataset encompasses data from Paris _intra-muros_ and from other cities within the French _departement_ `Île-de-France'.
+```{r count-paris}
+data_immo_all <- data_immo_all |> mutate(
+  location_city = ifelse(
+    city_name == "Paris", 
+    yes = "Paris - intra-muros", no = "Paris - Île-de-France")
+)
+
+data_immo_all |> count(location_city)
+```
+
+Let us visualize the distribution of prices per square meter by location.
+```{r, warning=FALSE, message=FALSE}
+#| fig-cap: "Price per square meter in different areas of our data. Paris _intra-muros_ refers to the 20 _arrondissements_ that constitute the core of the city, _Ile de France_ refers to the remaining metropolitan area."
+#| label: fig-plot-price-diff
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+ggplot(
+  data = data_immo_all,
+  mapping = aes(x = pm2, fill = location_city)) +
+  geom_histogram(position = "dodge") +
+  scale_fill_manual(
+    "location",
+    values = c(
+      "Paris - Île-de-France" = colors_[3], 
+      "Paris - intra-muros" = colors_[2])
+    ) +
+  scale_x_continuous(
+    labels = scales::label_comma(), 
+    limits = c(0, 20000)
+  ) +
+  labs(x = latex2exp::TeX("Price per $m^2$"), y = "Observations") +
+  global_theme() +
+  theme(legend.position = "bottom")
+```
+
+
+
+We restrict ourselves to Paris _intra-muros_.
+```{r clean-data}
+data_immo <- data_immo_all |> 
+  filter(city_name == "Paris")
+nrow(data_immo)
+```
+
+
+This leaves us with `r scales::number(nrow(data_immo), big.mark = ",")` cases. The range of the sale agreement date is:
+
+```{r show-selling-dates}
+range(data_immo$sale_agreement_date)
+```
+
+```{r, echo=FALSE, eval=FALSE}
+#| fig-cap: Number of monthly recorded sales.
+#| label: fig-monthly-sales
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+ggplot(
+  data = data_immo |> 
+    mutate(
+      month = lubridate::month(
+        sale_agreement_date, 
+        locale = "en_US", 
+        label = TRUE
+      )
+    ),
+  mapping = aes(x = month)
+) +
+  geom_bar(stat = "count") +
+  labs(x = NULL, y = "Number of observations") +
+  global_theme()
+```
+
+
+We use the prices per $m^2$ to normalize the errors by property size.
+
+```{r}
+#| fig-cap: Distribution of observed and estimated prices.
+#| label: fig-hist-prices-obs-estim
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+
+ggplot(
+  data = data_immo |> select(pm2, pm2_estimated) |> 
+    pivot_longer(cols = c(pm2, pm2_estimated)) |> 
+    mutate(
+      name = factor(
+        name, 
+        levels = c("pm2", "pm2_estimated"), 
+        labels = c("Observed price", "Estimated price")
+      )
+    ),
+  mapping = aes(x = value)
+) +
+  geom_histogram(position = "identity", colour = "white") +
+  facet_wrap(~name) +
+  labs(
+    x = latex2exp::TeX("Price per $m^2$ (thousand Euros)"),
+    y = "Number of observations"
+  ) +
+  scale_x_continuous(
+    label = scales::label_comma(scale = 1/1000), 
+    limits = c(0, 20000)
+  ) +
+  scale_y_continuous(label = scales::label_comma()) +
+  global_theme()
+```
+
+
+Let us also create a table with basic summary statistics for the price variables. First, we add labels to the columns of interest here.
+
+```{r data_immo-labels}
+data_immo <- data_immo |> 
+  labelled::set_variable_labels(
+    pm2 = "Observed Price per square meter",
+    pm2_estimated = "Estimated Price per square meter"
+  )
+```
+
+
+@tbl-desc-stats-prices shows standard statistics for both the observed and the estimated price.
+ 
+```{r}
+#| tbl-cap: "Descriptive statistics on prices."
+#| label: tbl-desc-stats-prices
+#| code-fold: true
+#| code-summary: Display the codes to create the Table.
+data_immo |> 
+  tbl_summary(
+    include = c("pm2", "pm2_estimated"),
+    type = all_continuous() ~ "continuous2",
+    statistic = list(
+      all_continuous() ~ c("{mean} ({sd})", "{median} ({p25}, {p75})"),
+      all_categorical() ~ "{n} ({p}%)"),
+    digits = list(
+      all_continuous() ~ 2,
+      all_categorical() ~ 0
+    )
+  ) |> 
+  modify_header(label ~ "**Variable**") |>
+  add_stat_label(
+    label = list(
+      all_continuous() ~ c("Mean (std)", "Median (Q1, Q3)"),
+      all_categorical() ~ "n (%)"
+    )
+  )
+```
+ 
+ 
+Let us remove outliers with a price per square meter of over €20,000 and observations from mostly commercial areas. 
+```{r data_immo-remove-outliers}
+data_immo <- 
+  data_immo |> 
+  filter(pm2 <= 20000)
+```
+
+
+In all, we then have access to `r scales::number(nrow(data_immo), big.mark = ",")` observations after these basic cleaning steps.
+
+
+
+## IRIS {#sec-data-iris}
+
+
+Our Data contains geospatial information, aggregated at the _IRIS_ (_Ilots Regroupés pour l'Information Statistique_) level, a statistical unit defined and published by the French National Institute of Statistics and Economic Studies.[^1] The city of Paris is divided into 20 _arrondissements_. Each IRIS located in Paris belongs to a single _arrondissement_.
+
+[^1]: For more information on IRIS, refer to [INSEE](https://www.insee.fr/en/metadonnees/definition/c1523).
+
+::: {.callout-tip}
+
+Three types of IRIS are distinguished:
+
+- **Residential IRIS**: their population generally ranges between 1,800 and 5,000 inhabitants. They are homogeneous in terms of housing type, and their boundaries are based on major breaks in the urban fabric (main roads, railways, watercourses, ...).
+
+- The IRIS for **economic activity**: they bring together more than 1,000 employees and have at least twice as many salaried jobs as resident population;
+
+- **Miscellaneous IRIS**: these are large, specific, sparsely populated areas with significant surface areas (amusement parks, port areas, forests, ...).
+
+Source: [Limites IRIS - Descriptif de contenu](https://geoservices.ign.fr/documentation/donnees/vecteur/contoursiris)
+
+:::
+
+
+The total number of IRIS is:
+```{r display-nb-iris}
+length(unique(data_immo$iris_name))
+```
+
+To plot maps, we first need to get a Parisian map. We use the `Contours... IRIS®' shapefile from [géoservices](https://geoservices.ign.fr/contoursiris) (_édition 2023_).
+
+```{r load-shapes_iris}
+shapes_iris <- str_c(
+  "../data/geo/CONTOURS-IRIS_3-0__SHP__FRA_2023-01-01/CONTOURS-IRIS/",
+  "1_DONNEES_LIVRAISON_2023-09-00134/CONTOURS-IRIS_3-0_SHP_LAMB93_FXX-2023"
+  ) |> 
+  sf::st_read(layer="CONTOURS-IRIS", quiet = TRUE)
+```
+
+We extract the Seine River for better looking maps:
+```{r define-shapes_seine}
+shapes_seine <- 
+  shapes_iris |> 
+  filter(grepl('Paris ', NOM_COM)) |> 
+  filter(grepl('Seine ', NOM_IRIS))
+```
+
+To display the Seine River with a single contour, let us create an union of all the polygons that define it:
+```{r define-shapes_seine-union}
+shapes_seine <- 
+  shapes_seine |> 
+  summarise(
+    geo_ = st_union(geometry)
+  )
+```
+
+Let us focus only on Paris _intra-muros_:
+```{r define-shapes_paris}
+shapes_paris <- 
+  shapes_iris |> 
+  filter(grepl('Paris ', NOM_COM)) |> 
+  mutate(size_poly = as.numeric(st_area(geometry))) |> 
+  filter(size_poly < 1840733.0)
+```
+
+
+Let us save these maps objects for later use.
+
+```{r save-shapes}
+save(shapes_paris, shapes_seine, file = "../data/shapes.rda")
+```
+
+
+Let us also export a table with all the IRIS codes in each _arrondissement_.
+```{r}
+aggregation_arrond <- 
+  shapes_paris |> 
+  select(NOM_COM, CODE_IRIS) |> 
+  st_drop_geometry() |> 
+  as_tibble() |> 
+  write_csv('../data/geo/aggregation_arrond.csv')
+```
+
+
+
+## Wealth Level per IRIS {#sec-data-wealth}
+
+The welth level per IRIS comes from the `_Revenus, pauvreté et niveau de vie en 2020 (Iris)_' distributed by the National Institute of Statistics and Economic Studies (INSEE). The data can be downloaded free of charge at the following addreess: <https://www.insee.fr/fr/statistiques/7233950#consulter>.
+
+```{r, message = FALSE, warning=FALSE}
+data_income <- read_delim(
+  str_c(
+    "../data/econ/", 
+    "BASE_TD_FILO_DISP_IRIS_2020_CSV/BASE_TD_FILO_DISP_IRIS_2020.csv"
+  ),
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+```
+
+The median income per IRIS can easily be computed.
+```{r}
+median_inc_data <- 
+  data_income |> 
+  select(CODE_IRIS = IRIS, DISP_MED20) |> 
+  mutate(DISP_MED20 = as.numeric(DISP_MED20))
+head(median_inc_data)
+```
+
+::: {.callout-note}
+
+A choropleth map with smoothed values is shown in @sec-neigh-wealth-iris in [Chapter -@sec-neighborhood-based-smoothing].
+
+:::
+
+
+From the Parisian map, we extract some information at the IRIS level: the name of the _arrondissement_ (`NOM_COM`), the name of the IRIS (`NOM_IRIS`), and the type of IRIS (`TYP_IRIS`).
+
+```{r define-iris_supplementary_data}
+iris_supplementary_data <- 
+  shapes_paris |> 
+  as_tibble() |> 
+  select(CODE_IRIS, NOM_COM, NOM_IRIS, TYP_IRIS)
+```
+
+This information can be added to the real estate data. We will also add income data at the IRIS level in the dataset and define a new categorical variable: `income_class` which takes three values:
+
+- `"rich"`{.R} if the income in the IRIS is larger or equal to €35,192,
+- `"poor"`{.R} if the income in the IRIS is lower or equal to €20,568,
+- `"others"`{.R} otherwise.
+
+
+```{r add-income_class}
+data_immo <- 
+  data_immo |> 
+  # Reduce to Parisan data
+  inner_join(iris_supplementary_data, by = "CODE_IRIS") |> 
+  left_join(
+    data_income |> 
+      select(CODE_IRIS = IRIS, median_income = DISP_MED20) |> 
+      mutate(median_income = as.numeric(median_income)),
+    by = "CODE_IRIS"
+  ) |> 
+  mutate(
+    income_class = if_else(
+      median_income >= 35192,
+      'rich', 
+      if_else(median_income <= 20568, 'poor', 'others')
+    )
+  )
+```
+
+
+
+## Export Data {#sec-export-data}
+
+
+We restrict ourselves to the residential IRIS (type `"H"`{.R}) and to sales where both the estimated and the observed price per square meter was below 20,000.
+```{r define-data_clean_all}
+data_clean_all <- 
+  data_immo |> 
+  filter(TYP_IRIS == 'H')  |> 
+  filter(pm2_estimated < 20000) |> 
+  filter(pm2 < 20000) 
+```
+
+Then, we save the table for later use.
+```{r}
+save(data_clean_all, file = "../data/data_clean_all.rda")
+write_csv(data_clean_all, file = "../data/data_clean_all.csv")
+```
+
+

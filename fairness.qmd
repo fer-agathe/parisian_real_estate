@@ -1,0 +1,979 @@
+# Fairness {#sec-fairness}
+
+```{r setup, message=FALSE, warning=FALSE}
+#| code-fold: true
+#| code-summary: Display the setting codes
+
+# Required packages----
+library(tidyverse)
+library(lubridate)
+library(gtsummary)
+library(labelled)
+library(sf)
+library(showtext)
+library(extrafont)
+library(wesanderson)
+
+# Graphs----
+font_main = font_title = 'Times New Roman'
+extrafont::loadfonts(quiet = T)
+face_text='plain'
+face_title='plain'
+size_title = 14
+size_text = 11
+legend_size = 11
+
+global_theme <- function() {
+  theme_minimal() %+replace%
+    theme(
+      text = element_text(family = font_main, size = size_text, face = face_text),
+      legend.text = element_text(family = font_main, size = legend_size),
+      axis.text = element_text(size = size_text, face = face_text), 
+      plot.title = element_text(
+        family = font_title, 
+        size = size_title, 
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+# Colours
+colors_ <- wes_palette('Rushmore1')
+col_seine <- "#2140A3"
+```
+
+In this chapter, we mention two types of fairness evaluation:
+
+1. **Demographic Parity** (@calders2009building) (DP): where the objective is the independence of the predictive model from the sensitive attribute,
+2. **Equalized Odds** (@hardt2016equality) (EO): where the objective is independence conditional on all values of the label space.
+
+However, we will compute the Equalized Odds only.
+
+## Background
+
+Recall that our objective is to predict outcomes (prices) within an ordered set $\mathcal{Y} := [K] = \{1, \ldots, K\}$. We thus face a multi-class classification framework. We use definitions of fairness that are suitable in this framework (see, _e.g._, @alghamdi2022beyond or @denis2021fairness).
+
+
+### Demographic Parity (DP)
+
+Let $\hat{Y}$ be the output of the predictive model $h\in\mathcal{H}$ defined on $\mathcal{X}$. From the algorithmic fairness literature, the (empirical) unfairness under DP is defined as follows:
+
+::: {.callout-tip}
+
+#### Fairness under Demographic Parity
+
+The unfairness under DP of a classifier $h$ is quantified by
+$$
+\mathcal{U}_{DP}(h) := \max_{a\in\mathcal{A}, k\in[K]} \left|\, \hat{\mathbb{P}}(\hat{Y} = k | ±\, A = a) - \hat{\mathbb{P}}(\hat{Y}  = k)\, \right|\enspace,
+$$
+
+where \(A \in \mathcal{A}\) with \(\mathcal{A} := [M] = \{1, \ldots, M\}\) is a discrete group representing specific geographic locations, which constitutes our sentitive attribute.
+
+A model $h$ is called (empirically) exactly fair under DP i.f.f. $\mathcal{U}_{DP}(h) = 0$.
+
+:::
+
+When the label $Y$ is assumed to be unbiased, there emerges a preference for a more nuanced measure of unfairness. Specifically, DP may hinder the realization of an ideal prediction scenario, such as granting loans precisely to those who are unlikely to default.
+
+
+### Equalized Odds (EO)
+
+We assume knowledge of the true and unbiased label $Y$. The fairness measure under EO is defined as follows:
+
+::: {.callout-tip}
+
+#### Fairness under Equalized Odds
+
+The unfairness under EO of a classifier $h$ is quantified by
+$$
+\mathcal{U}_{EO}(h) := \max_{a\in\mathcal{A}, k, k'\in[K]} \left|\,\hat{\mathbb{P}}(\hat{Y} = k |Y \, = k', \,A = a) - \hat{\mathbb{P}}(\hat{Y} = k | \,Y = k'\,)\right|\enspace.
+$$ {#eq-eo}
+
+
+A model $h$ is called (empirically) fair under EO i.f.f. $\mathcal{U}_{EO}(h) = 0$.
+
+
+:::
+
+
+In R, we define the `eo_measure()`{.R} function to compute component of the Equalized Odds formula, for a given protected group $a$.
+
+```{r}
+#' Calculate Equalized Odds Metrics
+#' 
+#' @param obs_name name of the variable with observed values in the data
+#' @param pred_name name of the variable with predicted values in the data
+#' @param quantile_cutoffs quantile cutoffs to use to partition observed and 
+#'   predicted values
+#' @param group_1 CODE_IRIS belonging to the group of interest ($a$)
+#' @param baseline_data data with all the observations
+#' 
+#' @returns a tibble where each row corresponds to a combination of levels of
+#'   the predicted value ($k$, column `quant_predicted`) and the observed 
+#'   value ($k'$, column `quant_observed`). For each row, the column 
+#'   `value_diff` gives $\hat{P}(\hat{Y} = k | Y = k', A=a) -$ 
+#'   $\hat{P}(\hat{Y} = k | Y = k')$ ()
+eo_measure <- function(obs_name = "pm2",
+                       pred_name = "pm2_estimated",
+                       quantile_cutoffs,
+                       group_1,
+                       baseline_data){
+  
+  # Assign each bin (based on quantile_cutoffs) to the observed and to the
+  # predicted values
+  data <- 
+    baseline_data |> 
+    mutate(
+      cut_observed = cut(
+        !!sym(obs_name), 
+        quantile_cutoffs, 
+        c(1:(length(quantile_cutoffs) - 1))
+      )
+    ) |> 
+    mutate(
+      cut_predictions = cut(
+        !!sym(pred_name), 
+        quantile_cutoffs, 
+        c(1:(length(quantile_cutoffs) - 1))
+      )
+    )
+  
+  retainer_1 <- c()
+  retainer_2 <- c()
+  value_retainer <- c()
+  # Looping over classes (k)
+  for (level_1 in c(1:(length(quantile_cutoffs) - 1))) {
+    # Looping over classes (k')
+    for (level_2 in c(1:(length(quantile_cutoffs) - 1))) {
+      
+      # Identify whether Y==k & \hat{Y} == k'
+      bucket_tmp <- 
+        data |> 
+        select(
+          CODE_IRIS, !!obs_name, !!pred_name, cut_observed, cut_predictions
+        ) |> 
+        mutate(
+          in_bucket = if_else(
+            cut_observed == level_1 & cut_predictions == level_2, 1, 0)
+        )
+      
+      # \hat{P}(\hat{Y} = k | Y = k')
+      p_average <- 
+        bucket_tmp |> 
+        pull(in_bucket)|> 
+        mean(na.rm = T)
+      
+      # \hat{P}(\hat{Y} = k | Y = k', A=a)
+      p_special <- 
+        bucket_tmp|> 
+        filter(CODE_IRIS %in% group_1) |> 
+        pull(in_bucket) |> 
+        mean(na.rm = T)
+      
+      # Store this (we need to find the max among those at the end of the loop)
+      value_tmp <- abs(p_special - p_average)
+      
+      value_retainer <- c(value_retainer, value_tmp)
+      retainer_1 <- c(retainer_1, level_1)
+      retainer_2 <- c(retainer_2, level_2)
+    }
+  }
+  
+ tibble(
+    value_diff = value_retainer, 
+    quant_observed = retainer_1, 
+    quant_estimated = retainer_2
+  )
+}
+```
+
+
+## Load Data {#sec-load-data-fairness}
+
+
+Let us load the real estate data that were cleaned in @sec-export-data in [Chapter -@sec-data].
+
+```{r load-data_immo}
+load("../data/data_clean_all.rda")
+```
+
+Let us also load the Parisian map saved in @sec-data-iris from [Chapter -@sec-data].
+```{r load-aggregation_arrond}
+load("../data/shapes.rda")
+```
+
+
+
+In @sec-spatial-price-smoothing from [Chapter -@sec-neighborhood-based-smoothing], we computed the minimum distance from one iris to another, considering distances up to 30. We will also need this informations.
+```{r load-neighbours_all, message=FALSE, warning=FALSE}
+neighbours_all <- read_csv('../data/neighbours/all_neighbours_paris.csv')
+```
+
+
+## Equalized Odds
+
+Let us compute the Equalized Odds, using the `eo_measure()`{.R} function. We will consider the predicted prices as well as some randomly drawn values. In each case, we will compute the Equalized Odds.
+
+
+### EO with Predicted Prices
+
+We need to define a partitioning of the data. We consider the quantiles of the observed price as the cutoffs. We will make the number of neighbors used to spatially smooth data vary. But before doing so, we would like to spend some time with a small example.
+
+```{r define-limits_quants}
+limits_quants <- 
+  data_clean_all |> 
+  pull(pm2) |> 
+  quantile(seq(0,1,0.2)) |> 
+  unname()
+limits_quants
+```
+
+We want to examine the variation of the EO depending on the aggregation considered. Let us consider the immediate neighbors to begin with.
+```{r define-num_neigh-illustr}
+num_neigh <- 1
+```
+
+We will focus on two IRIS: Montmartre and Champs-de-Mars (see @fig-smoothed-diffs from [Chapter -@sec-neighborhood-based-smoothing] to locate those two IRIS on the Parisian map). We extract the IRIS codes of those two IRIS.
+```{r define-want_montmartre-and-want_mars}
+want_montmartre <- 
+  neighbours_all |> 
+    filter(from_iris == '751093503') |> 
+    filter(distance <= num_neigh) |> 
+    pull(to_iris)
+want_mars <- 
+  neighbours_all |> 
+    filter(from_iris == '751072812') |> 
+    filter(distance <= num_neigh) |> 
+    pull(to_iris)
+```
+
+Then, we can compute the components of the EO formula, for each combination of $k$ and $k'$ (see @eq-eo).
+```{r}
+re_mont <- eo_measure(
+  obs_name = "pm2",
+  pred_name = "pm2_estimated",
+  quantile_cutoffs = limits_quants, 
+  group_1 = want_montmartre, 
+  baseline_data = data_clean_all
+)
+re_mont
+```
+Let us extract, among these elements, the maximum value:
+```{r}
+eo_mont <- 
+  re_mont |> 
+   arrange(desc(value_diff)) |> 
+    head(1) |> 
+    pull(value_diff)
+```
+
+
+We do the same for Champs de Mars:
+```{r define-eo_mars}
+re_mars <- eo_measure(
+  obs_name = "pm2",
+  pred_name = "pm2_estimated",
+  quantile_cutoffs = limits_quants, 
+  group_1 = want_mars, 
+  baseline_data = data_clean_all
+)
+
+eo_mars <- 
+  re_mars |> 
+   arrange(desc(value_diff)) |> 
+    head(1) |> 
+    pull(value_diff)
+eo_mars
+```
+
+Now, let us encompass the previous code inside a loop to consider different spatial aggregation levels.
+```{r loop-mont-mars-eo}
+all_eo_mars <- c()
+all_eo_mont <- c()
+for (num_neigh in c(1:9)) {
+  # Montmartre----
+  want_montmartre <- 
+    neighbours_all |> 
+    filter(from_iris == '751093503') |> 
+    filter(distance <= num_neigh) |> 
+    pull(to_iris)
+  
+  re_mont <- eo_measure(
+    obs_name = "pm2",
+    pred_name = "pm2_estimated",
+    quantile_cutoffs = limits_quants, 
+    group_1 = want_montmartre, 
+    baseline_data = data_clean_all
+  )
+  
+  eo_mont_value_tmp <- 
+    re_mont |> 
+    arrange(desc(value_diff)) |> 
+    head(1) |> 
+    pull(value_diff)
+  
+  all_eo_mont <- c(all_eo_mont, eo_mont_value_tmp)
+
+  # Champs-de-Mars----
+  want_mars <- 
+    neighbours_all %>% 
+    filter(from_iris == '751072812') |> 
+    filter(distance <= num_neigh) |> 
+    pull(to_iris)
+  
+  re_mars <- eo_measure(
+    obs_name = "pm2",
+    pred_name = "pm2_estimated",
+    quantile_cutoffs = limits_quants, 
+    group_1 = want_mars, 
+    baseline_data = data_clean_all
+  )
+  
+  eo_mars_value_tmp <- 
+    re_mars |> 
+    arrange(desc(value_diff)) |> 
+    head(1) |> 
+    pull(value_diff)
+  
+  all_eo_mars <- c(all_eo_mars, eo_mars_value_tmp)
+}
+```
+
+We can then store the EO computed for Montmartre and for Champs-de-Mars, depending on the number of neighbors considered.
+```{r}
+data_eo_res <- tibble(
+  neighbours = c(1:9),
+  all_mars = all_eo_mars, 
+  all_nine = all_eo_mont, 
+)
+data_eo_res
+```
+
+### EO with Random Values
+
+Let us now turn to the evaluation of EO where we no longer use the predicted prices, but rather draw random values, in a similar fashion to what was done in @sec-calib-random from [Chapter -@sec-model-calibration].
+
+We define a function, `eo_measure_random()`{R} that will compute the EO based on random values for the predicted prices. This function works as follows:
+
+1. Simulation of observed prices:
+
+  - we draw values from a Uniform distribution, where the bounds are the price range from the estimated prices
+
+2. 
+
+
+```{r define-eo_measure_random}
+#' Calculate Equalized Odds Metrics using randomly drawn predicted values
+#' 
+#' @param obs_name name of the variable with observed values in the data
+#' @param pred_name name of the variable with predicted values in the data
+#' @param quantile_cutoffs quantile cutoffs to use to partition observed and 
+#'   predicted values
+#' @param baseline_data data with all the observations
+#' 
+#' @returns a list with two elements:
+#'  - `data_random` the data set with randomly drawn values for the prediction
+#'  - `metrics`: #' a tibble where each row corresponds to a combination of levels of
+#'   the predicted value ($k$, column `quant_predicted`) and the observed 
+#'   value ($k'$, column `quant_observed`). For each row, the column 
+#'   `value_diff` gives $\hat{P}(\hat{Y} = k | Y = k', A=a) -$ 
+#'   $\hat{P}(\hat{Y} = k | Y = k')$ ()
+eo_measure_random <- function(obs_name = "pm2",
+                              pred_name = "pm2_estimated",
+                              quantile_cutoffs,
+                              baseline_data) {
+  
+  # Simulate estimated prices----
+  
+  # bounds for the Uniform
+  range_prices <- 
+    baseline_data |> 
+    pull(!!pred_name) |> 
+    range()
+  # No values to draw
+  rand_obs <- nrow(baseline_data)
+  # Draw values
+  random_prices <- runif(rand_obs, range_prices[1], range_prices[2])
+  
+  # Replace observed values by random ones
+  data_random <- baseline_data |>  
+    mutate(!!pred_name := !!random_prices)
+  
+  # Assign each bin (based on quantile_cutoffs) to the observed and to the
+  # 'predicted' values (random data)
+  data_random <- data_random |> 
+    mutate(
+      cut_observed = cut(
+        !!sym(obs_name),
+        quantile_cutoffs, 
+        c(1:(length(quantile_cutoffs) - 1))
+      )
+    )|> 
+    mutate(
+      cut_predictions = cut(
+        !!sym(pred_name),
+        quantile_cutoffs, 
+        c(1:(length(quantile_cutoffs) - 1))
+      )
+    )
+  
+  # Assign each bin (based on quantile_cutoffs) to the observed and to the
+  # predicted values (baseline data)
+  data <- baseline_data |> 
+    mutate(
+      cut_observed = cut(
+        !!sym(obs_name),
+        quantile_cutoffs, 
+        c(1:(length(quantile_cutoffs) - 1))
+      )
+    )|> 
+    mutate(
+      cut_predictions = cut(
+        !!sym(pred_name),
+        quantile_cutoffs, 
+        c(1:(length(quantile_cutoffs) - 1))
+      )
+    )
+  
+  
+  retainer_1 <- c()
+  retainer_2 <- c()
+  value_retainer <- c()
+  # Looping over classes (k)
+  for (level_1 in c(1:(length(quantile_cutoffs) - 1))) {
+    # Looping over classes (k)
+    for (level_2 in c(1:(length(quantile_cutoffs) - 1))) {
+      
+      
+      ## Identify whether Y==k & \hat{Y} == k' (baseline data)
+      bucket_tmp <- 
+        data |> 
+        select(
+          CODE_IRIS, !!obs_name, !!pred_name, cut_observed, cut_predictions
+        ) |> 
+        mutate(
+          in_bucket = if_else(
+            cut_observed == level_1 & cut_predictions == level_2, 1, 0)
+        )
+      
+      # (random data)
+      bucket_random_tmp <- 
+        data_random |> 
+        select(
+          CODE_IRIS, !!obs_name, !!pred_name, cut_observed, cut_predictions
+        ) |> 
+        mutate(
+          in_bucket = if_else(
+            cut_observed == level_1 & cut_predictions == level_2, 1, 0)
+        )
+      
+      ## \hat{P}(\hat{Y} = k | Y = k') (on baseline data)
+      p_average <- bucket_tmp |> 
+        pull(in_bucket) |> 
+        mean(na.rm = T)
+      
+      ## \hat{P}(\hat{Y} = k | Y = k', A=a) (on random data)
+      p_special <-
+        bucket_random_tmp |> 
+        pull(in_bucket) |> 
+        mean(na.rm = T)
+      
+      # Store this (we need to find the max among those at the end of the loop)
+      value_tmp <- abs(p_special - p_average)
+      
+      value_retainer <- c(value_retainer, value_tmp)
+      retainer_1 <- c(retainer_1, level_1)
+      retainer_2 <- c(retainer_2, level_2)
+    }
+  }
+  
+  list(
+    data_random = data_random,
+    metrics = tibble(
+      value_diff = value_retainer, 
+      quant_observed = retainer_1, 
+      quant_estimated = retainer_2
+    )
+  )
+}
+```
+
+We compute the components of the EO formula:
+```{r define-re}
+re <- eo_measure_random(
+  obs_name = "pm2",
+  pred_name = "pm2_estimated",
+  quantile_cutoffs = limits_quants, 
+  baseline_data = data_clean_all
+)
+data_random <- re$data_random
+re$metrics
+```
+
+
+Then, among these elements, we extract the maximum value:
+```{r define-random_eo}
+random_eo <- 
+  re$metrics |> 
+  arrange(desc(value_diff)) |> 
+  head(1) |> 
+  pull(value_diff)
+random_eo
+```
+
+## Visualization of the Results {#sec-fairness-viz-iris}
+
+Let us now visualize how the EO metrics expands as the level of spatial aggregation increases, starting from the two IRIS regions corresponding to Champs-de-Mars and Montmartre.
+
+Let us isolate each level of neighbors for Champs-de-Mars and Montmartre. The following loop will create objects named `full_champ_1` (immediate neighbors), `full_champ_2` (neighbors of neighbors), etc. up to `full_champ_8`
+
+```{r define-full_champs}
+for (num_neigh in 1:8) {
+  full_champs_current <- 
+    shapes_paris |> 
+    left_join(
+      neighbours_all |> 
+        filter(from_iris == '751072812') |> 
+        filter(distance == !!num_neigh) |> 
+        mutate(is_neigh = 'yes') |> 
+        mutate(CODE_IRIS = as.character(to_iris)) |> 
+        select(CODE_IRIS, is_neigh),
+      by = "CODE_IRIS"
+    ) |> 
+    mutate(is_neigh = if_else(is.na(is_neigh), 'no', 'yes')) |> 
+    group_by(is_neigh) |> 
+    summarise(comb_lev_1 = st_union(geometry)) |> 
+    filter(is_neigh == 'yes')
+  
+  assign(str_c("full_champ_", num_neigh), value = full_champs_current)
+}
+```
+
+Let us do something similar for Montmartre.
+```{r}
+for (num_neigh in 1:8) {
+  full_mont_current <- 
+    shapes_paris |> 
+    left_join(
+      neighbours_all |> 
+        filter(from_iris == '751093503') |> 
+        filter(distance == !!num_neigh) |> 
+        mutate(is_neigh = 'yes') |> 
+        mutate(CODE_IRIS = as.character(to_iris)) |> 
+        select(CODE_IRIS, is_neigh),
+      by = "CODE_IRIS"
+    ) |> 
+    mutate(is_neigh = if_else(is.na(is_neigh), 'no', 'yes')) |> 
+    group_by(is_neigh) |> 
+    summarise(comb_lev_1 = st_union(geometry)) |> 
+    filter(is_neigh == 'yes')
+  
+  assign(str_c("full_mont_", num_neigh), value = full_mont_current)
+}
+```
+
+
+We will use the following colors to identify the distance for the neighbors:
+```{r define-colors_want}
+colors_want <- terrain.colors(9)
+```
+
+::: {.panel-tabset}
+
+### Champs-de-Mars
+
+```{r}
+#| fig-cap: Champs de Mars and its IRIS neighbors.
+#| label: fig-eo-neighbours-champ
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+map_champ <- 
+  shapes_paris |> 
+  mutate(centroid = st_centroid(geometry)) |> 
+  ggplot() +
+  geom_sf() + 
+  geom_sf(data = full_champ_8, fill = colors_want[8], color = 'black') + 
+  geom_sf(data = full_champ_7, fill = colors_want[7], color = 'black') + 
+  geom_sf(data = full_champ_6, fill = colors_want[6], color = 'black') + 
+  geom_sf(data = full_champ_5, fill = colors_want[5], color = 'black') + 
+  geom_sf(data = full_champ_4, fill = colors_want[4], color = 'black') + 
+  geom_sf(data = full_champ_3, fill = colors_want[3], color = 'black') + 
+  geom_sf(data = full_champ_2, fill = colors_want[2], color = 'black') + 
+  geom_sf(data = full_champ_1, fill = colors_want[1], color = 'black') + 
+  geom_sf(data = shapes_seine, fill = col_seine) + 
+  global_theme() +
+  theme(legend.position = 'bottom') + 
+  labs(fill = 'EO measure')
+
+map_champ
+```
+
+### Montmartre
+
+```{r}
+#| fig-cap: Montmartre and its IRIS neighbors.
+#| label: fig-eo-neighbours-mont
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+map_mont <- 
+  shapes_paris |> 
+  mutate(centroid = st_centroid(geometry)) |> 
+  ggplot() +
+  geom_sf() + 
+  geom_sf(data = full_mont_8, fill = colors_want[8], color = 'black') + 
+  geom_sf(data = full_mont_7, fill = colors_want[7], color = 'black') + 
+  geom_sf(data = full_mont_6, fill = colors_want[6], color = 'black') + 
+  geom_sf(data = full_mont_5, fill = colors_want[5], color = 'black') + 
+  geom_sf(data = full_mont_4, fill = colors_want[4], color = 'black') + 
+  geom_sf(data = full_mont_3, fill = colors_want[3], color = 'black') + 
+  geom_sf(data = full_mont_2, fill = colors_want[2], color = 'black') + 
+  geom_sf(data = full_mont_1, fill = colors_want[1], color = 'black') + 
+  geom_sf(data = shapes_seine, fill = col_seine) + 
+  global_theme() +
+  theme(legend.position = 'bottom') + 
+  labs(fill = 'EO measure')
+
+map_mont
+```
+
+:::
+
+Now, let us plot the EO measure as a function of the neighbor level.
+
+```{r}
+#| fig-cap: Equalized Odds Measure for Montmartre and Champ-de-Mars.
+#| label: fig-eo-mont-champ
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+lineplot_eo <- 
+  data_eo_res |> 
+  select(
+    neighbors = neighbours, 
+    `Champs de Mars` = all_mars, 
+    Montmartre = all_nine
+  ) |> 
+  mutate(neighbors = as.character(neighbors)) |> 
+  pivot_longer(
+    cols = c(`Champs de Mars`:Montmartre),
+    names_to = "IRIS region", values_to = "value"
+  ) %>% 
+  ggplot(data = .) + 
+  geom_hline(
+    mapping = aes(
+      yintercept = random_eo, 
+      color = 'value for random estimation'
+    ), 
+    lwd = 2, 
+    lty = 'dashed'
+  ) +
+  geom_line(
+    mapping = aes(
+      x = neighbors,
+      y = value, 
+      group = `IRIS region`
+    )
+  ) + 
+  geom_point(
+    mapping = aes(
+      x = neighbors,
+      y = value,
+      fill = neighbors
+    ),
+    pch = 21,
+    size = 4
+  ) + 
+  # Champs-de-Mars
+  geom_segment(
+    x = 2.5,
+    y = (data_eo_res$all_mars[2] + data_eo_res$all_mars[3]) / 2,
+    xend = 4,
+    yend = .5,
+    lty = 3
+  ) +
+  geom_segment(
+    x = 4,
+    y = .5,
+    xend = 8,
+    yend = .5,
+    lty = 3
+  ) +
+  annotate(
+    geom = "text", x = 5, 
+    y = .55, 
+    label = "Champs-de-Mars",
+    hjust = 0
+  ) +
+  # Montmartre
+  geom_segment(
+    x = 3.5,
+    y = (data_eo_res$all_nine[3] + data_eo_res$all_nine[4]) / 2,
+    xend = 5,
+    yend = .3,
+    lty = 3
+  ) +
+  geom_segment(
+    x = 5,
+    y = .3,
+    xend = 8,
+    yend = .3,
+    lty = 3
+  ) +
+  annotate(
+    geom = "text", x = 5.75, 
+    y = .35, 
+    label = "Montmartre",
+    hjust = 0
+  ) +
+  scale_color_manual(values = c('lightgrey')) + 
+  scale_fill_manual(values = colors_want) +
+  ylab(latex2exp::TeX(r'($U_{EO}(h)$)')) +
+  xlab('Neighbor level') + 
+  global_theme() + 
+  theme(
+    legend.position = 'bottom',
+    # legend.box="vertical",
+    legend.text = element_text(family = font_main, size = 14)
+  ) + 
+  guides(fill = guide_legend(override.aes = list(size=5), nrow=1)) + 
+  guides(color = guide_legend(title='')) + 
+  guides(linetype = guide_legend(title='')) + 
+  ylim(c(0,0.739))
+
+lineplot_eo
+```
+
+Let us load the calibration errors computed for those two IRIS, in @sec-calib-mont-champ in [Chapter -@sec-model-calibration].
+
+```{r}
+load("../data/ece_neighbours_montmartre.rda")
+load("../data/ece_neighbours_mars.rda")
+```
+
+```{r}
+#| fig-cap: Expected Calibration Error Measure for Montmartre and Champ-de-Mars.
+#| label: fig-ece-mont-champ
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+lineplot_ece <- 
+  ece_neighbours_montmartre |> 
+  bind_rows(ece_neighbours_mars) |> 
+  rename(`IRIS region` = iris_name) |> 
+  mutate(neighbors = as.character(neighbours), value = ece) |> 
+  ggplot() + 
+  geom_hline(
+    mapping = aes(
+      yintercept = .0262022, # VALUE OBTAINED IN PREVIOUS CHAPTER
+      color = 'value for random estimation'
+    ), 
+    lwd = 2, 
+    lty = 'dashed'
+  ) +
+  geom_line(
+    mapping = aes(
+      x = neighbors,
+      y = ece, 
+      group = `IRIS region`,
+    )
+  ) + 
+  geom_point(
+    mapping = aes(
+      x = neighbors,
+      y = value,
+      fill = neighbors
+    ),
+    pch = 21,
+    size = 4
+  ) + 
+  # Champs-de-Mars
+  geom_segment(
+    x = 1.5,
+    y = (ece_neighbours_mars$ece[1] + ece_neighbours_mars$ece[2]) / 2,
+    xend = 3,
+    yend = .5,
+    lty = 3
+  ) +
+  geom_segment(
+    x = 3,
+    y = .5,
+    xend = 7,
+    yend = .5,
+    lty = 3
+  ) +
+  annotate(
+    geom = "text", x = 4,
+    y = .55,
+    label = "Champs-de-Mars",
+    hjust = 0
+  ) +
+  # Montmartre
+  geom_segment(
+    x = 3.5,
+    y = (ece_neighbours_montmartre$ece[3] + ece_neighbours_montmartre$ece[4]) / 2,
+    xend = 5,
+    yend = .3,
+    lty = 3
+  ) +
+  geom_segment(
+    x = 5,
+    y = .3,
+    xend = 8,
+    yend = .3,
+    lty = 3
+  ) +
+  annotate(
+    geom = "text", x = 5.75, 
+    y = .35, 
+    label = "Montmartre",
+    hjust = 0
+  ) +
+  scale_color_manual(values = c('lightgrey')) + 
+  scale_fill_manual(values = colors_want) +
+  ylab(latex2exp::TeX(r'($U_{ECE}(h)$)')) +
+  xlab('Neighbor level') + 
+  global_theme() + 
+  theme(
+    legend.position = 'bottom',
+    # legend.box="vertical",
+    legend.text = element_text(family = font_main, size = 14)
+  ) + 
+  guides(fill = guide_legend(override.aes = list(size = 5), nrow = 1)) + 
+  guides(color = guide_legend(title = '')) + 
+  guides(linetype = guide_legend(title='')) + 
+  ylim(c(0,0.739))
+
+lineplot_ece
+```
+
+```{r, echo=FALSE, echo=FALSE}
+p <- ggpubr::ggarrange(
+  map_champ,
+  lineplot_eo,
+  lineplot_ece,
+  map_mont,
+  ncol = 4,
+  nrow = 1,
+  legend = "bottom", 
+  common.legend = T
+)
+ggsave(p, file = "example_metrics.png", height = 3, width = 17, bg = "white")
+```
+
+
+## EO on each _Arrondissement_ {#sec-fairness-eo-arrond}
+
+Now, we can compute the Equalized Odds metric on each _arrondissement_. For convenience, let us create a function, `calculate_eo_arrond()`{.R}, that computes EO on a single arrondissement.
+
+```{r define-calculate_eo_arrond}
+#' EO metric for an arrondissement
+#' 
+#' @param arrond name of the arrondissement
+#' @param num_neigh distance of neighbors to include
+#' @param obs_name name of the variable with observed values in the data
+#' @param pred_name name of the variable with predicted values in the data
+#' @param data dataset to use
+calculate_eo_arrond <- function(arrond, 
+                                num_neigh, 
+                                obs_name = "pm2",
+                                pred_name = "pm2_estimated",
+                                data) {
+  
+  # Cutoff to partition data
+  limits_quants <- 
+    data |> 
+    pull(!!obs_name) |> 
+    quantile(seq(0,1,0.2)) |> 
+    unname()
+  
+  # Extract IRIS in the arrondissement
+  want_arrond <- 
+    data |> 
+    filter(NOM_COM %in% arrond) |> 
+    pull(CODE_IRIS) |> 
+    unique()
+  
+  re_arrond <- eo_measure(
+    obs_name = obs_name,
+    pred_name = pred_name,
+    quantile_cutoffs = limits_quants, 
+    group_1 = want_arrond, 
+    baseline_data = data
+  )
+  
+  ece_arrond <- 
+    re_arrond |> 
+    arrange(desc(value_diff)) |> 
+    head(1) |> 
+    pull(value_diff)
+  
+  ece_arrond
+}
+```
+
+
+All that needs to be done is to loop over the names of the _arrondissements_.
+```{r define-eo_arrond}
+name_arronds <- unique(data_clean_all$NOM_COM)
+name_arronds <- name_arronds[!is.na(name_arronds)]
+
+eo_arrond <- map_dbl(
+  .x = name_arronds,
+  .f = ~calculate_eo_arrond(
+    arrond = .x, 
+    num_neigh = 5, 
+    obs_name = "pm2", 
+    pred_name = "pm2_estimated", 
+    data = data_clean_all
+  )
+)
+```
+
+We can put those values in a tibble:
+```{r define-eo_arrond_tb}
+eo_arrond_tb <- tibble(
+  arrondissement = name_arronds,
+  ece = eo_arrond
+) |> 
+  mutate(
+    arrondissement = factor(
+      arrondissement, 
+      levels = str_c(
+        "Paris ", 1:20, "e", c("r", rep("", 19)), " Arrondissement")
+    )
+  ) |> 
+  arrange(arrondissement)
+```
+
+The values can be saved:
+```{r save-eo_arrond_tb}
+save(eo_arrond_tb, file = "../data/eo_arrond_tb.rda")
+```
+
+
+For comparison with the Expected Calibration Error, let us load the results obtained in @sec-ece-arrond in [Chapter -@sec-model-calibration].
+```{r}
+load("../data/ece_arrond_tb.rda")
+```
+
+
+
+The values are reported in @tbl-eo-arrond.
+```{r}
+#| tbl-cap: Equalized Odds per _Arrondissement_.
+#| label: tbl-eo-arrond
+#| code-fold: true
+#| code-summary: Display the codes used to create the Table
+ece_arrond_tb |> 
+  left_join(
+    eo_arrond_tb, by = "arrondissement"
+  ) |> 
+  knitr::kable(
+    booktabs = TRUE, digits = 3,
+    col.names = c("Arrondissement", "ECE", "EO")
+  )
+```
+
+
+
+
+

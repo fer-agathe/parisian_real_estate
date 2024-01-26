@@ -1,0 +1,1454 @@
+# Model Calibration {#sec-model-calibration}
+
+```{r setup, message=FALSE, warning=FALSE}
+#| code-fold: true
+#| code-summary: Display the setting codes
+
+# Required packages----
+library(tidyverse)
+library(lubridate)
+library(gtsummary)
+library(labelled)
+library(sf)
+library(showtext)
+library(extrafont)
+library(wesanderson)
+library(zoo)
+library(locfit)
+library(LDATS)
+library(ramify)
+
+# Graphs----
+font_main = font_title = 'Times New Roman'
+extrafont::loadfonts(quiet = T)
+face_text='plain'
+face_title='plain'
+size_title = 14
+size_text = 11
+legend_size = 11
+
+global_theme <- function() {
+  theme_minimal() %+replace%
+    theme(
+      text = element_text(family = font_main, size = size_text, face = face_text),
+      legend.text = element_text(family = font_main, size = legend_size),
+      axis.text = element_text(size = size_text, face = face_text), 
+      plot.title = element_text(
+        family = font_title, 
+        size = size_title, 
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+# Colours
+colors_ <- wes_palette('Rushmore1')
+col_seine <- "#2140A3"
+```
+
+
+In this part, we look at the calibration of the model. In a nutshell, in traditional regression, a model output denoted as $\hat{Z}$ is considered well calibrated for $Z$ when (@calib2019reg):
+$$
+\mathbb{E}\left[ Z \mid \hat{Z} \right] = \hat{Z}\enspace.
+$$
+
+However, here, we discretize the variable of interest (square meter prices) so as to obtain a multi-class variable $\mathcal{Y} = [K]$, where $K>0$ is a positive integer.
+
+Here, we focus on ordinal regression. The variable of interest is denoted as $\mathcal{Y} = [K]$, where $K>0$ is a positive integer. In this context, a model $h\in\mathcal{H}$ is deemed well calibrated in predicting the distribution of confident scores $\hat{\boldsymbol{P}}$ (@widmann2019calibration) if:
+$$
+\mathbb{P}(Y = k | \,\hat{\boldsymbol{P}} = \hat{\boldsymbol{p}}) = \hat{p}_k,\quad \text{ for all }k\in[K]\enspace,
+$$
+where $\hat{\boldsymbol{p}} = (\hat{p}_1, \ldots, \hat{p}_K)$ and $\hat{p}_k$ represents the (confidence) score or probability estimate for class $k$ under the model $h$.
+
+To measure the calibration of a model, we rely on the group-wise calibration error, or in the calibration literature, the Expected Calibration Error (ECE) (@naeini2015obtaining) denoted $\mathcal{U}_{ECE}$. 
+
+
+The empirical distribution is calculated as follows:
+$$
+\hat{\mathbb{P}}_{(\boldsymbol{X}_i, Y_i)_i}:= \frac{1}{n} \sum_{i=1}^n \delta_{(\boldsymbol{X}_i, Y_i)}\enspace,
+$$ {#eq-empirical-distrib}
+where $(\boldsymbol{X}_i, Y_i)_{i=1, \ldots, n}$is the empirical data, i.i.d. copies of $(\boldsymbol{X}, Y)$.
+
+
+Let the interval $[0,1]$ be partitioned into $B$ bins based on quantiles of $\max_k \hat{p}_k$ values, where each bin $b\in[B]$ is associated with the set $\mathcal{I}_b$ containing the indices of instances within that bin. This partitioning is used in the subsequent definition of the ECE, which is applicable to the multi-class classification framework and thereby extends to ordinal regression.
+
+::: {.callout-tip}
+
+## Model calibration in multi-class classification
+
+To quantify the ECE, we introduce the accuracy and confidence measures within each bin $b\in[B]$:
+
+- **Accuracy**:
+  $$\textrm{acc}(\mathcal{I}_b) = \hat{\mathbb{P}}_{(\boldsymbol{X}_i, Y_i)_{i\in\mathcal{I}_b}}(Y=\hat{Y})$$
+- **Confidence**:
+  $$\textrm{conf}(\mathcal{I}_b) = \hat{\mathbb{E}}_{(\boldsymbol{X}_i, Y_i)_{i\in\mathcal{I}_b}} (\max_k \hat{p}_k)\enspace.
+    %\frac{1}{n_b} \sum_{i \in b} \max_k \hat{p}_k^{(i)}$$
+
+The **calibration error measure** for a model $h\in\mathcal{H}$ is then defined as
+$$
+\mathcal{U}_{ECE}(h) := \frac{1}{n} \sum_{b\in[B]} |\mathcal{I}_b| \cdot \left|\textrm{acc}(\mathcal{I}_b) - \textrm{conf}(\mathcal{I}_b)\right|
+\enspace,
+$$
+and model $h$ is considered (group-wise) well calibrated if $\mathcal{U}_{ECE}(h) = 0$.
+
+:::
+
+
+
+## Load Data
+
+Let us load the real estate data that were cleaned in @sec-export-data, in [Chapter -@sec-data].
+
+```{r}
+load("../data/data_clean_all.rda")
+```
+
+
+Let us have a look at the quantiles of the observed and the estimated prices. We consider here levels from 0 to 1 in steps of .05 for the quantiles.
+
+```{r define-quantile_data}
+probs <- seq(0, 1, .05)
+quantile_data <- tibble(
+  true_price_quant = quantile(data_clean_all$pm2, probs = probs), 
+  estim_price_quant = quantile(data_clean_all$pm2_estimated, probs = probs)
+)
+```
+
+```{r}
+#| fig-cap: Quantiles of observed prices as a function of quantiles of estimated prices. The violet line is the bissector.
+#| label: fig-quantiles-obs-estim
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+ggplot(
+  data = quantile_data, 
+  mapping = aes(x = estim_price_quant, y = true_price_quant)
+) + 
+  geom_point(color = "lightblue", alpha = 0.8) +
+  geom_abline(color="violetred", alpha = 0.5) +
+  labs(
+    x = "Quantiles of estimated square meter prices",
+    y = "Quantiles of observed square meter prices",
+  ) +
+  scale_x_continuous(labels = scales::label_comma()) +
+  scale_y_continuous(labels = scales::label_comma()) +
+  global_theme()
+```
+
+
+## Illustrative Example {#sec-calib-illustrative}
+
+Let us consider an illustrative example, where we discretize the data into 5 classes.
+```{r define-k-illustr}
+k <- 5
+```
+
+Let us store the observed and predicted prices in two vectors.
+```{r define-obs-pred-illustr}
+obs <- data_clean_all$pm2
+pred <- data_clean_all$pm2_estimated
+```
+
+
+Based on the predicted prices $\hat{Y}$, we define 5 bins:
+```{r define-quantiles-illustr}
+quantiles <- quantile(pred, probs = (0:k) / k)
+quantiles
+```
+
+We compute the midpoint of each bin:
+```{r define-midpoints-illustr}
+midpoints <- quantiles |> rollmean(quantiles, k = 2)
+midpoints <- midpoints[-length(midpoints)]
+midpoints
+```
+
+Next, we compute the length of each bin, which corresponds to the distance between quantiles:
+
+```{r define-dist_q-illustr}
+dist_quantiles <- diff(quantiles) # to normalize deviation
+dist_q <- tibble(
+  pred_labs = 1:length(dist_quantiles), 
+  dist = dist_quantiles
+) |> 
+  mutate(pred_labs = pred_labs)
+dist_q
+```
+
+Then, for each observed price and each predicted price, we can assign the bin in which it lies.
+```{r}
+# Change first and last values of quantiles (0% - 100%)
+quantiles[1] <- 0
+quantiles[length(quantiles)] <- Inf
+# Get true and predicted labels based on quantiles
+obs_labels <- cut(
+  obs, breaks = quantiles, labels = 1:(length(quantiles) - 1)
+) |> 
+  as.numeric()
+pred_labels <- cut(
+  pred, breaks = quantiles, labels = 1:(length(quantiles)-1)
+) |> 
+  as.numeric()
+```
+
+Let us put the results in a tibble:
+```{r define-data_to_display-illustr}
+data_to_display <- tibble(
+  obs = obs,
+  pred = pred,
+  obs_labs = obs_labels, 
+  pred_labs = pred_labels
+) |>
+  left_join(dist_q, by="pred_labs")
+data_to_display
+```
+
+### Calibration Curve
+
+Now, in each bin, we can compute the mean of observed and predicted prices (` obs_mean` and `pred_mean`). This will allow us to create a calibration curve. We also compute the number of observation in the bin (`nb`), the length of the bin (`dist`), the midpoints of the two quantiles defining the bin (`midpoints`), and the difference between the average observed price and the average predicted price (`diff`).
+
+```{r define-local_means-illustr}
+local_means <- data_to_display |> 
+  group_by(pred_labs) |> 
+  summarise(
+    obs_mean = mean(obs),
+    pred_mean = mean(pred),
+    nb = n(),
+    dist = min(dist)
+  ) |>
+  mutate(midpoints = midpoints) |>
+  mutate(diff = obs_mean - pred_mean)
+local_means
+```
+
+Let us draw the calibration curve. We can define a color for each bin (we generate 10 but will only use 5 here).
+```{r define-colours-illustr}
+colours <- RColorBrewer::brewer.pal(10, "Paired")
+names(colours) <- seq_len(max(10))
+```
+
+The calibration curve is shown in @fig-calibration-bins-illustr. If the model was perfectly calibrated, the dots would all be on the bissector.
+```{r}
+#| fig-cap: "Calibration on the whole dataset estimated using 5 bins. Prices are in thousand Euros."
+#| label: fig-calibration-bins-illustr
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+x_lim <- c(-500, 25000)
+ggplot() + 
+  geom_point(
+    data = data_to_display |> 
+      mutate(pred_labs = factor(pred_labs)), 
+    mapping = aes(
+      x = pred, y = obs, 
+      color = pred_labs
+    ), 
+    alpha = 0.3
+  ) +
+  scale_colour_manual(values = colours[1:k]) +
+  # Mean point in each bin
+  geom_point(
+    data = local_means, 
+    mapping = aes(x = pred_mean, y = obs_mean)
+  ) +
+  # in thousand Euros
+  labs(
+    x = "Estimated square meter prices",
+    y = "Observed square meter prices"
+  ) +
+  scale_x_continuous(
+    labels = scales::label_comma(scale = 1/1000), limits = x_lim
+  ) +
+  scale_y_continuous(
+    labels = scales::label_comma(scale = 1/1000), limits = x_lim
+  ) +
+  geom_abline(color="black", alpha = 0.5) + 
+  guides(color = "none") + 
+  global_theme()
+```
+
+
+We can also use a barplot to visualize how far the average observed prices are from the average predicted prices in each bin.
+```{r}
+#| fig-cap: "Calibration on the whole dataset estimated using 5 bins: difference between the average observed price and the average predicted price, in each bin. Prices are in thousand Euros."
+#| label: fig-calibration-bins-illustr-barplot
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+y_lim_bar <- range(local_means$diff)
+y_lim_bar[1] <- round(y_lim_bar[1]) - 100
+y_lim_bar[2] <- round(y_lim_bar[2]) + 100
+ggplot(
+  data = local_means,
+  mapping = aes(x = pred_mean, y = diff, fill = factor(pred_labs))
+) +
+  geom_bar(stat = "identity") +
+  geom_segment(
+    mapping = aes(
+      x = min(pred_mean), 
+      y = 0, 
+      xend = max(pred_mean),
+      yend = 0),
+    colour = "black",
+    alpha = 0.1,
+    linewidth = .1
+  ) +
+  scale_fill_manual(values = colours[1:k]) +
+  scale_x_continuous(
+    labels = scales::label_comma(scale = 1/1000), limits = x_lim
+  ) +
+  scale_y_continuous(
+    labels = scales::label_comma(scale = 1/1000), limits = y_lim_bar
+  ) +
+  guides(fill = "none") + 
+  # in thousand Euros
+  labs(x = "Estimated square meter prices",, y = "Difference") +
+  global_theme() +
+  theme(
+    panel.grid.minor = element_blank(),
+    axis.text.x = element_blank(), 
+    axis.ticks.x = element_blank()
+  )
+```
+
+### Expected Calibration Error
+
+Now, let us compute the Expected Calibration Error.
+```{r}
+n_obs <- nrow(data_clean_all)
+```
+
+This time, we need to partition the data according to the quantiles computed on the **observed** prices.
+```{r define-quantiles-obs-illustr}
+quantiles <- quantile(data_clean_all$pm2, probs = (0:k) / k)
+quantiles
+```
+
+The length of each bin:
+```{r define-dist_quantiles-ece-illustr}
+dist_quantiles <- diff(quantiles)
+dist_quantiles
+```
+
+
+And the midpoints:
+```{r define-midpoints-ilustr}
+midpoints <- quantiles %>% rollmean(quantiles, k = 2)
+midpoints <- midpoints[-length(midpoints)]
+midpoints
+```
+
+Let us get the true and predicted labels based on these quantiles:
+
+```{r define-true-labels-ece-illustr}
+# Change first and last values of quantiles (0% - 100%)
+quantiles[1] <- 0
+quantiles[length(quantiles)] <- Inf
+obs_labels <- as.numeric(
+  cut(obs, breaks = quantiles, labels = 1:(length(quantiles)-1))
+)
+pred_labels <- as.numeric(
+  cut(pred, breaks = quantiles, labels = 1:(length(quantiles)-1))
+)
+```
+
+Let us put those values in a tibble:
+```{r define-data_to_display-ece-illustr}
+data_to_display <- tibble(
+  obs = obs,
+  pred = pred,
+  obs_labs = obs_labels, 
+  pred_labs = pred_labels
+)
+data_to_display
+```
+
+We can then compute the distances between the predicted prices and the midpoints. First, we initiate a matrix which will contain the distances.
+```{r define-dist_y_hat}
+dist_y_hat <- matrix(data = NA, nrow = n_obs, ncol = length(midpoints))
+```
+
+For each example in the data, we will compute the distance of the predicted price to each of the midpoints of the quantile-defined bins. Before doing so, let us show an example with the first observation. The predicted price is:
+```{r show-first-pred-price}
+data_to_display$pred[1]
+```
+
+Its predicted bin is:
+```{r}
+data_to_display$pred_labs[1]
+```
+
+To compute the distance between an observation and a midpoint of a bin, we create a function, `distance_metric()`{.R}.
+
+```{r define-distance_metric-illustr}
+#' Calculates distance between a data point and a midpoint by normalizing to 1
+#' distance between quantiles
+#' 
+#' @param x observation
+#' @param x_class assigned bin class
+#' @param midpoint midpoint midpoints of the bin of interest
+#' @param midpoints midpoints of all the bins
+#' @param quantiles quantiles defining the bins
+#' @param dist_quantiles length of each bin
+distance_metric <- function(x, 
+                            x_class, 
+                            midpoint, 
+                            midpoints,
+                            quantiles,
+                            dist_quantiles
+                            ) {
+  midpoint_class <- which(midpoints == midpoint)
+  if (x_class == midpoint_class){
+    return(distance(x, midpoint) / dist_quantiles[x_class])
+  } else if (x_class > midpoint_class){
+    diff_class <- x_class - midpoint_class
+    dist <- rep(NA, 2)
+    # First and last distance values
+    dist[1] <- 0.5
+    dist[length(dist)] <- 
+      distance(quantiles[x_class], x) / dist_quantiles[x_class]
+    dist <- sum(dist)
+    if (diff_class > 1) {
+      dist <- dist + (diff_class - 1)
+    }
+    return(dist)
+  } else {
+    diff_class <- midpoint_class - x_class
+    dist <- rep(NA, 2)
+    # First and last distance values
+    dist[1] <- 
+      distance(quantiles[x_class + 1], x) / dist_quantiles[x_class]
+    dist[length(dist)] <- 0.5
+    dist <- sum(dist)
+    if (diff_class > 1) {
+      dist <- dist + (diff_class - 1)
+    }
+    return(dist)
+  }
+}
+```
+
+This function needs another one, `distance()`{.R}, that returns the Euclidean distance between two points in $\mathbb{R}$.
+```{r define-distance-illustr}
+distance <- function(a, b) {
+  return(abs(a - b))
+}
+```
+
+The distance to the `j-th` midpoint can be computed as follows:
+```{r show-ex-distance_metric-illustr}
+j <- 1
+distance_metric(
+  x = data_to_display$pred[1], 
+  x_class = data_to_display$pred_labs[1], 
+  midpoint = midpoints[j],
+  midpoints = midpoints,
+  quantiles = quantiles,
+  dist_quantiles = dist_quantiles
+)
+```
+
+Let us apply this `distance_metric()`{.R} function to all the observations, and for each observation, to all the midpoints.
+
+```{r loop-dist-illustr}
+for (i in 1:n_obs) {
+  for (j in 1:length(midpoints)) {
+    dist_y_hat[i,j] <- distance_metric(
+      x = data_to_display$pred[i], 
+      x_class = data_to_display$pred_labs[i], 
+      midpoint = midpoints[j],
+      midpoints = midpoints,
+      quantiles = quantiles,
+      dist_quantiles = dist_quantiles
+    )
+  }
+}
+```
+
+
+The predicted prices for the 10 first observations are:
+```{r show-first-10-pred-illustr}
+data_to_display$pred[1:10]
+```
+
+And the distances to each midpoint:
+```{r show-distances-midpoints-first-10-illustr}
+dist_y_hat[1:10,]
+```
+Let us save these results (so that we can re-use them in [Chapter -@sec-mitigation]).
+```{r}
+as_tibble(dist_y_hat) |> 
+  rename_with(~str_remove(.x, "V"), .cols = everything()) |> 
+  mutate(id = data_clean_all$id) |> 
+  relocate(id, .before = `1`) |> 
+  write_csv("../data/distances.csv")
+```
+
+
+
+
+For each observation, we can then apply the softmax function so that the distances for each observation sum to 1. The resulting values are considered as scores.
+```{r define-confidence_scores-illustr}
+confidence_scores <- LDATS::softmax(-dist_y_hat)
+confidence_scores[1:10,]
+```
+We can then assign a predicted label based on the distance:
+```{r define-predicted_labels-illustr}
+predicted_labels <- ramify::argmax(confidence_scores)
+predicted_labels[1:10]
+```
+
+Let us extract the maximum score for each observation:
+```{r}
+max_confidence_scores <- apply(confidence_scores, 1, max)
+max_confidence_scores[1:10]
+```
+
+These scores can be added to the `data_to_display` tibble.
+```{r add-scores_conf-illustr}
+data_to_display <- data_to_display |>  
+    mutate(scores_conf = max_confidence_scores)
+```
+
+Recall that in `data_to_display`, each observed price and each predicted price were assigned to a bin. The bins were defined using the quantiles computed on the predicted prices. It is possible to compare the assigned bin based on the observed or the predicted value. We can use this comparison to compute an overall accuracy.
+```{r add-accuracy-illustr}
+data_to_display <- data_to_display |> 
+    mutate(acc = if_else(obs_labs == pred_labs, 1, 0))
+```
+
+Eventually, we can compute the expected calibration error. Let us define new bins based on the predicted scores we just obtained.
+```{r define-breaks-illustr}
+breaks <- quantile(data_to_display$scores_conf, probs = (0:k) / k)
+breaks
+```
+
+We need to assign, for each score in the dataset, the corresponding bin.
+
+```{r define-tb_breaks-illustr}
+tb_breaks <- tibble(breaks = breaks, labels = 0:k) |>
+  group_by(breaks) |>
+  slice_tail(n = 1) |>
+  ungroup()
+tb_breaks
+```
+Let us add the corresponding bin in `data_to_display` and save the tibble in a new one called `x_with_class`.
+```{r define-x_with_class-illustr}
+x_with_class <- data_to_display |>
+  mutate(
+    score_bin = cut(
+      scores_conf,
+      breaks = tb_breaks$breaks,
+      labels = tb_breaks$labels[-1],
+      include.lowest = TRUE
+    )
+  )
+x_with_class
+```
+
+In each bin defined using the scores, we can compute the accuracy and the confidence:
+```{r}
+ece_by_bin <- x_with_class |>  
+  group_by(score_bin) |> 
+  summarise(
+    acc = mean(acc), 
+    conf = mean(scores_conf), 
+    nb = n()
+  )
+ece_by_bin
+```
+Lastly, we can compute the expected calibration error:
+```{r}
+ece <- sum((ece_by_bin$nb / n_obs) * abs(ece_by_bin$acc - ece_by_bin$conf))
+ece
+```
+
+
+## Helper Functions
+
+For convenience, let us wrap the code from the illustrative example into some helper functions.
+
+### Quantile Binning
+
+First, we are going to build a function that will:
+
+1. partition the interval $[0,1]$ into $B$ bins, based on quantiles of the estimated prices, where each bin $b\in[B]$ is associated with the set $\mathcal{I}_b$ containing the indices of instances within that bin,
+2. assign to each observed and predicted values the corresponding bin it lies in, and also return the middle of value of the corresponding bin,
+
+```{r}
+#' Partition predicted values into k bins
+#' 
+#' @param obs vector of observed values (y)
+#' @param pred vector of predicted values (\hat{y})
+#' @param k number of bins
+#' @param partition_along which vector of values to use to partition 
+#' (`"obs"` or `"pred`)
+#' 
+#' @returns a list with four elements:
+#'  - `quantiles`: the empirical quantiles of the predicted values
+#'  - `midpoints`: the midpoint of each bin
+#'  - `dist_quantiles`: the width of each bin
+#'  - `data_to_display`: a tibble with the observed and predicted values, as well
+#'    as their predicted bins (`obs_labs` and `pred_labs`), and the middle of
+#'    the bin (`dist`)
+quantile_binning <- function(obs, 
+                             pred, 
+                             k,
+                             partition_along = c("obs", "pred")
+                             ) {
+  
+  if (partition_along == "obs") {
+    # Define k bins on Y (quantile)
+    quantiles <- quantile(obs, probs = (0:k) / k)
+  } else {
+    # Define k bins on \hat_{Y} (quantile)
+    quantiles <- quantile(pred, probs = (0:k) / k)
+  }
+  
+  # Midpoints of those quantiles
+  midpoints <- quantiles |> rollmean(quantiles, k = 2)
+  midpoints <- midpoints[-length(midpoints)]
+  # Distance between quantiles (length of each bin)
+  dist_quantiles <- diff(quantiles) # to normalize deviation
+  dist_q <- tibble(
+    pred_labs = 1:length(dist_quantiles), 
+    dist = dist_quantiles
+  ) |> 
+    mutate(pred_labs = pred_labs)
+  # Change first and last values of quantiles (0% - 100%)
+  quantiles[1] <- 0
+  quantiles[length(quantiles)] <- Inf
+  # Get true and predicted labels based on quantiles
+  obs_labels <- cut(
+    obs, breaks = quantiles, labels = 1:(length(quantiles) - 1)
+  ) |> 
+    as.numeric()
+  pred_labels <- cut(
+    pred, breaks = quantiles, labels = 1:(length(quantiles)-1)
+  ) |> 
+    as.numeric()
+  data_to_display <- tibble(
+    obs = obs,
+    pred = pred,
+    obs_labs = obs_labels, 
+    pred_labs = pred_labels
+  ) |>
+    left_join(dist_q, by="pred_labs")
+  
+  list(
+    quantiles = quantiles,
+    midpoints = midpoints,
+    dist_quantiles = dist_quantiles,
+    data_to_display = data_to_display
+  )
+}
+```
+
+
+Then, we define another function, `compute_local_means()`{.R}, that computes for each bin the average observed values $E[Y|\hat{Y} \in [q_b ; q_{b+1}]]$ and the average predicted values $E[\hat{Y}|\hat{Y} \in [q_b,q_{b+1}]]$.
+
+```{r define-compute_local_means}
+#' Estimate `E[Y|\hat{Y} \in [q_k ; q_{k+1}]]` related to
+#' `E[\hat{Y}|\hat{Y} \in [q_k,q_{k+1}]]`.
+#' 
+#' @param obs vector of observed values (y)
+#' @param pred vector of predicted values (\hat{y})
+#' @param midpoints midpoints of all the bins
+compute_local_means <- function(obs, 
+                                pred, 
+                                data_to_display, 
+                                midpoints) {
+  local_means <- data_to_display |> 
+    group_by(pred_labs) |> 
+    summarise(
+      obs_mean = mean(obs),
+      pred_mean = mean(pred),
+      nb = n(),
+      dist = min(dist)
+    ) |>
+    mutate(midpoints = midpoints) |>
+    mutate(diff = obs_mean - pred_mean)
+  local_means
+}
+```
+
+
+### Expected Calibration Error
+
+First, we need to define a function, `distance()`{.R}, that returns the Euclidean distance between two points in in $\mathcal{R}$.
+```{r define-distance}
+distance <- function(a, b) {
+  return(abs(a - b))
+}
+```
+
+Second, we define a function to compute the distance between a data point an a midpoint. The distance between quantiles is normalized to 1. 
+
+```{r define-distance_metric}
+#' Calculates distance between a data point and a midpoint by normalizing to 1
+#' distance between quantiles
+#' 
+#' @param x observation
+#' @param x_class assigned bin class
+#' @param midpoint midpoint midpoints of the bin of interest
+#' @param midpoints midpoints of all the bins
+#' @param quantiles quantile defining the bins
+#' @param dist_quantiles length of each bin
+distance_metric <- function(x, 
+                            x_class, 
+                            midpoint, 
+                            midpoints,
+                            quantiles,
+                            dist_quantiles
+                            ) {
+  midpoint_class <- which(midpoints == midpoint)
+  if (x_class == midpoint_class){
+    return(distance(x, midpoint) / dist_quantiles[x_class])
+  } else if (x_class > midpoint_class){
+    diff_class <- x_class - midpoint_class
+    dist <- rep(NA, 2)
+    # First and last distance values
+    dist[1] <- 0.5
+    dist[length(dist)] <- 
+      distance(quantiles[x_class], x) / dist_quantiles[x_class]
+    dist <- sum(dist)
+    if (diff_class > 1) {
+      dist <- dist + (diff_class - 1)
+    }
+    return(dist)
+  } else {
+    diff_class <- midpoint_class - x_class
+    dist <- rep(NA, 2)
+    # First and last distance values
+    dist[1] <- 
+      distance(quantiles[x_class + 1], x) / dist_quantiles[x_class]
+    dist[length(dist)] <- 0.5
+    dist <- sum(dist)
+    if (diff_class > 1) {
+      dist <- dist + (diff_class - 1)
+    }
+    return(dist)
+  }
+}
+```
+
+Lastly, we need a function to compute the Expected Calibration Error.
+
+
+```{r}
+#' Function to calculate ECE
+#' 
+#' @param obs vector of observed values (y)
+#' @param pred vector of predicted values (\hat{y})
+#' @param k number of bins
+calculate_ece <- function(obs, 
+                          pred, 
+                          k) {
+  n_obs <- length(obs)
+  
+  # Quantile binning
+  q_binning <- quantile_binning(
+    obs = obs, pred = pred, k = k, partition_along = "obs"
+  )
+  data_to_display <- q_binning$data_to_display
+  quantiles <- q_binning$quantiles
+  midpoints <- q_binning$midpoints
+  dist_quantiles <- q_binning$dist_quantiles
+  
+  # Distance between predicted price and each midpoint of the bins
+  dist_y_hat <- matrix(data = NA, nrow = n_obs, ncol = length(midpoints))
+  for (i in 1:n_obs) {
+    for (j in 1:length(midpoints)) {
+      dist_y_hat[i,j] <- distance_metric(
+        x = data_to_display$pred[i], 
+        x_class = data_to_display$pred_labs[i], 
+        midpoint = midpoints[j],
+        midpoints = midpoints,
+        quantiles = quantiles,
+        dist_quantiles = dist_quantiles
+      )
+    }
+  }
+  
+  # Softmax applied on the distances: get the scores
+  confidence_scores <- LDATS::softmax(-dist_y_hat)
+  
+  # Predicted labels
+  predicted_labels <- ramify::argmax(confidence_scores)
+  
+  # Max score for each observation: confidence
+  max_confidence_scores <- apply(confidence_scores, 1, max)
+  data_to_display <- data_to_display |>  
+    mutate(scores_conf = max_confidence_scores)
+  
+  # Accuracy
+  data_to_display <- data_to_display |> 
+    mutate(acc = if_else(obs_labs == pred_labs, 1, 0))
+  
+  # ECE
+  # new bins based on scores
+  breaks <- quantile(data_to_display$scores_conf, probs = (0:k) / k)
+  tb_breaks <- tibble(breaks = breaks, labels = 0:k) |>
+    group_by(breaks) |>
+    slice_tail(n = 1) |>
+    ungroup()
+  
+  x_with_class <- data_to_display |>
+    mutate(
+      score_bin = cut(
+        scores_conf,
+        breaks = tb_breaks$breaks,
+        labels = tb_breaks$labels[-1],
+        include.lowest = TRUE
+      )
+    )
+  
+  # Accuracy and Confidence in each bin
+  ece_by_bin <- x_with_class |>  
+    group_by(score_bin) |> 
+    summarise(
+      acc = mean(acc), 
+      conf = mean(scores_conf), 
+      nb = n()
+    )
+  
+  ece <- sum((ece_by_bin$nb / n_obs) * abs(ece_by_bin$acc - ece_by_bin$conf))
+  ece
+}
+```
+
+
+## Whole Dataset
+
+Let us apply the `quantile_binning()`{.R} function to split the data into bins and compute the average of observed prices and predicted prices in each bin.
+
+
+Let us make the number of bins vary so that we consider in turn 3, 5, and 10 bins.
+```{r define-k_values}
+k_values <- c(3, 5, 10)
+```
+
+
+We initiate empty objects that will contain the estimated means of observed and predicted prices in each bin.
+```{r define-data_to_display}
+data_to_display <- local_means <- ece_values <- 
+  vector(mode = "list", length(k_values))
+```
+
+We can the loop over the different values for the number of bins to consider:
+```{r loop-bins-whole}
+for (i in 1:length(k_values)) {
+  k <- k_values[i]
+  obs <- data_clean_all$pm2
+  pred <- data_clean_all$pm2_estimated
+  res_q <- quantile_binning(
+    obs = obs, pred = pred, k = k, partition_along = "pred"
+  )
+  data_to_display[[i]] <- res_q$data_to_display |> mutate(k = !!k)
+  
+  # For calibration curve
+  local_means_current <- compute_local_means(
+    obs = obs, pred = pred, 
+    data_to_display = res_q$data_to_display, 
+    midpoints = res_q$midpoints
+  )
+  local_means[[i]] <- local_means_current |> mutate(k = !!k)
+  
+  # Calculate ECE
+  ece_current <- calculate_ece(
+    obs = obs, 
+    pred = pred,
+    k = k
+  )
+  ece_values[[i]] <- ece_current
+}
+```
+
+Let us bind the tibbles into a single one:
+```{r}
+data_to_display <- list_rbind(data_to_display) |> as_tibble()
+local_means <- list_rbind(local_means) |> as_tibble()
+```
+
+Now, let us visualize the calibration of the price model for the different number of bins that we envisaged. To do so, we loop over the different values for the number of bins and create a calibration graph in each case.
+
+Let us define some colors:
+```{r define-colours}
+colours <- RColorBrewer::brewer.pal(10, "Paired")
+names(colours) <- seq_len(max(10))
+```
+
+Then we prepare the plots:
+```{r create-plots-calib-whole-varying-bins}
+plots <- vector(mode = "list", length = length(k_values))
+for (i in 1:length(k_values)) {
+  k <- k_values[i]
+  data_to_display_k <- data_to_display |> filter(k == !!k)
+  local_means_k <- local_means |> filter(k == !!k)
+  
+  x_lim <- c(-500, 25000)
+  y_lim_bar <- range(local_means$diff)
+  y_lim_bar[1] <- round(y_lim_bar[1]) - 100
+  y_lim_bar[2] <- round(y_lim_bar[2]) + 100
+  
+  scatter_plot <- ggplot() + 
+    # All prices
+    geom_point(
+      data = data_to_display_k |> 
+        mutate(pred_labs = factor(pred_labs)), 
+      mapping = aes(
+        x = pred, y = obs, 
+        color = pred_labs
+      ), 
+      alpha = 0.3
+    ) +
+    scale_colour_manual(values = colours[1:k]) +
+    # Mean point in each bin
+    geom_point(
+      data = local_means_k, 
+      mapping = aes(x = pred_mean, y = obs_mean)
+    ) +
+    # in thousand Euros
+    labs(
+      x = "Estimated square meter prices",
+      y = "Observed square meter prices"
+    ) +
+    scale_x_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = x_lim
+    ) +
+    scale_y_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = x_lim
+    ) +
+    geom_abline(color="black", alpha = 0.5) + 
+    guides(color = "none") + 
+    global_theme()
+  
+  
+  bar_plot <- ggplot(
+    data = local_means_k,
+    mapping = aes(x = pred_mean, y = diff, fill = factor(pred_labs))
+  ) +
+    geom_bar(stat = "identity") +
+    geom_segment(
+      mapping = aes(
+        x = min(pred_mean), 
+        y = 0, 
+        xend = max(pred_mean),
+        yend = 0),
+      colour = "black",
+      alpha = 0.1,
+      linewidth = .1
+    ) +
+    scale_fill_manual(values = colours[1:k]) +
+    scale_x_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = x_lim
+    ) +
+    scale_y_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = y_lim_bar
+    ) +
+    guides(fill = "none") + 
+    # in thousand Euros
+    labs(x = NULL, y = "Difference") +
+    global_theme() +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_blank(), 
+      axis.ticks.x = element_blank()
+    )
+  
+  title_plot <- 
+    ggplot() + 
+    labs(title = str_c(k, " bins\n (ECE: ", round(ece_values[[i]],3), ")")) + 
+    global_theme()
+  
+  plots[[i]] <- 
+    list(
+      title_plot = title_plot,
+      scatter_plot = scatter_plot,
+      bar_plot = bar_plot
+    )
+  
+}
+```
+
+
+We can then display the calibration plots. The left panel in @fig-calibration-bins-whole shows the calibration when considering `r k_values[1]` bins, the panel in the middle is when the number of bins is `r k_values[2]` and the one on the right is when the number of bins is `r k_values[3]`.
+
+```{r, warning=FALSE, message=FALSE}
+#| fig-cap: "Calibration on the whole dataset estimated using different number of bins. Prices are in thousand Euros."
+#| label: fig-calibration-bins-whole
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+cowplot::plot_grid(
+  plots[[1]]$title_plot,
+  plots[[2]]$title_plot,
+  plots[[3]]$title_plot,
+  #
+  plots[[1]]$scatter_plot,
+  plots[[2]]$scatter_plot,
+  plots[[3]]$scatter_plot,
+  #
+  plots[[1]]$bar_plot,
+  plots[[2]]$bar_plot,
+  plots[[3]]$bar_plot,
+  ncol = 3,
+  rel_heights = c(1, 10, 2),
+  align = "v"
+)
+```
+
+
+## Comparison With a Single _Arrondissement_
+
+Let us now consider 5 bins, and contrast three situations for the calibration of the model:
+
+1. using the whole dataset as previously,
+2. using the whole dataset but with prices estimated randomly drawn,
+2. focusing on a single _arrondissement_.
+
+```{r setting-k-5}
+# Number of desired bins
+k <- 5
+
+# Init. result object
+data_to_display <- local_means <- ece_values <- 
+  vector(mode = "list", 3)
+```
+
+
+### On the Whole Dataset
+
+```{r calib-whole-5}
+obs <- data_clean_all$pm2
+pred <- data_clean_all$pm2_estimated
+
+res_q <- quantile_binning(
+  obs = obs, pred = pred, k = k, partition_along = "pred"
+)
+data_to_display[[1]] <- res_q$data_to_display |> mutate(type = "Whole dataset")
+local_means_current <- compute_local_means(
+    obs = obs, 
+    pred = pred,
+    data_to_display = res_q$data_to_display, 
+    midpoints = res_q$midpoints
+  )
+local_means[[1]] <- local_means_current |> mutate(type = "Whole dataset")
+
+ece_current <- calculate_ece(
+    obs = obs, 
+    pred = pred,
+    k = k
+  )
+ece_values[[1]] <- ece_current
+```
+
+
+### Random Model {#sec-calib-random}
+
+We will draw the values for $\hat{y}$ on a $\mathcal{U}[\underline{Y}, \overline{Y}]$, where $\underline{Y}$ represents the minimum of the observed prices and $\overline{Y}$ represents the maximum of the observed prices.
+
+```{r calib-random-5}
+n <- nrow(data_clean_all)
+y_lim <- c(min(data_clean_all$pm2), max(data_clean_all$pm2))
+# Draw n values from a U[min(Y), max(Y)]
+set.seed(123)
+obs <- data_clean_all$pm2
+pred <- runif(n, y_lim[1], y_lim[2])
+res_q <- quantile_binning(
+  obs = obs, pred = pred, k = k, partition_along = "pred"
+)
+data_to_display[[2]] <- res_q$data_to_display |> mutate(type = "Random Model")
+local_means_current <- compute_local_means(
+  obs = obs, 
+  pred = pred,
+  data_to_display = res_q$data_to_display, 
+  midpoints = res_q$midpoints
+)
+local_means[[2]] <- local_means_current |> mutate(type = "Random Model")
+
+ece_current <- calculate_ece(
+    obs = obs, 
+    pred = pred,
+    k = k
+  )
+ece_values[[2]] <- ece_current
+```
+
+
+### 7th _Arrondissement_ {#sec-calib-comparison-7th}
+
+Let us focus on the 7th _arrondissement_. We first need to know which IRIS codes are in the th _arrondissement_. To do so, we can simply use the `NOM_COM` variable in the dataset.
+
+
+```{r define-data_7th}
+data_7th <- 
+  data_clean_all |> 
+  filter(NOM_COM == "Paris 7e Arrondissement")
+nrow(data_7th)
+```
+
+Let us compute the average values of observed and predicted prices in each bins defined using the 5 quantiles of the observed prices in the 7th _arrondissement_.
+
+```{r calib-7th-arrond-5}
+obs <- data_7th$pm2
+pred <- data_7th$pm2_estimated
+res_q <- quantile_binning(
+  obs = obs, pred = pred, k = k, partition_along = "pred"
+)
+data_to_display[[3]] <- res_q$data_to_display |> 
+  mutate(type = "7th arrondissement")
+local_means_current <- compute_local_means(
+  obs = obs, 
+  pred = pred,
+  data_to_display = res_q$data_to_display, 
+  midpoints = res_q$midpoints
+)
+local_means[[3]] <- local_means_current |> mutate(type = "7th arrondissement")
+
+ece_current <- calculate_ece(
+    obs = obs, 
+    pred = pred,
+    k = k
+  )
+ece_values[[3]] <- ece_current
+```
+
+### Visualizing the Calibration for the 3 Cases
+
+Now, we can create the calibration plot in each of the three situations, and plot the result.
+
+```{r}
+plots_compar <- vector(mode = "list", length = 3)
+for (i in 1:3) {
+  data_to_display_curr <- data_to_display[[i]]
+  local_means_curr <- local_means[[i]]
+  
+  
+  x_lim <- c(0, max(data_clean_all$pm2))
+  if (data_to_display_curr$type[1] == "Random Model") {
+    y_lim_bar <- range(local_means_curr$diff)
+  } else {
+    y_lim_bar <- map(local_means[c(1,3)], "diff") |> 
+      map(range) |> 
+      unlist() |> 
+      range()
+  }
+  y_lim_bar[1] <- round(y_lim_bar[1]) - 100
+  y_lim_bar[2] <- round(y_lim_bar[2]) + 100 
+  
+  
+  scatter_plot <- ggplot() + 
+    # All prices
+    geom_point(
+      data = data_to_display_curr |> 
+        mutate(pred_labs = factor(pred_labs)), 
+      mapping = aes(
+        x = pred, y = obs, 
+        color = pred_labs
+      ), 
+      alpha = 0.3
+    ) +
+    scale_colour_manual(values = colours) +
+    # Mean point in each bin
+    geom_point(
+      data = local_means_curr, 
+      mapping = aes(x = pred_mean, y = obs_mean)
+    ) +
+    # in thousand Euros
+    labs(
+      x = "Estimated square meter prices",
+      y = "Observed square meter prices"
+    ) +
+    scale_x_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = x_lim
+    ) +
+    scale_y_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = x_lim
+    ) +
+    geom_abline(color="black", alpha = 0.5) + 
+    guides(color = "none") + 
+    global_theme()
+  
+  bar_plot <- ggplot(
+    data = local_means_curr,
+    mapping = aes(x = pred_mean, y = diff, fill = factor(pred_labs))
+  ) +
+    geom_bar(stat = "identity") +
+    geom_segment(
+      mapping = aes(
+        x = min(pred_mean), 
+        y = 0, 
+        xend = max(pred_mean),
+        yend = 0),
+      colour = "black",
+      alpha = 0.1,
+      linewidth = .1
+    ) +
+    scale_fill_manual(values = colours[1:k]) +
+    scale_x_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = x_lim
+    ) +
+    scale_y_continuous(
+      labels = scales::label_comma(scale = 1/1000), limits = y_lim_bar
+    ) +
+    guides(fill = "none") + 
+    # in thousand Euros
+    labs(x = NULL, y = "Difference") +
+    global_theme() +
+    theme(
+      panel.grid.minor = element_blank(),
+      axis.text.x = element_blank(), 
+      axis.ticks.x = element_blank()
+    )
+  
+  title <- str_c(
+    unique(data_to_display_curr$type), "\n (ECE:", round(ece_values[[i]], 3), ")"
+  )
+  
+  title_plot <- 
+    ggplot() + 
+    labs(title = title) + 
+    global_theme()
+  
+  plots_compar[[i]] <- 
+    list(
+      title_plot = title_plot,
+      scatter_plot = scatter_plot,
+      bar_plot = bar_plot
+    )
+  
+}
+```
+
+The results are shown in @fig-calibration-5-bins-comparison, with the calibration estimated on the whole dataset on the left panel, the calibration estimated when the estimated prices are randomly drawn in the middle panel, and the calibration estimated on the subset of observations corresponding to the 7th _arrondissement_ only.
+
+```{r, message=FALSE, warning=FALSE}
+#| fig-cap: "Calibration on the whole dataset (left), on the observation from the 7th \emph{arrondissement} only (right) and on randomly drawn values (middle); bins defined using quintiles. Prices are in thousand Euros."
+#| label: fig-calibration-5-bins-comparison
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure.
+cowplot::plot_grid(
+  plots_compar[[1]]$title_plot,
+  plots_compar[[2]]$title_plot,
+  plots_compar[[3]]$title_plot,
+  #
+  plots_compar[[1]]$scatter_plot,
+  plots_compar[[2]]$scatter_plot,
+  plots_compar[[3]]$scatter_plot,
+  #
+  plots_compar[[1]]$bar_plot,
+  plots_compar[[2]]$bar_plot,
+  plots_compar[[3]]$bar_plot,
+  ncol = 3,
+  rel_heights = c(1, 10, 2),
+  align = "v"
+)
+```
+
+
+
+## ECE in each _Arrondissement_ {#sec-ece-arrond}
+
+
+Let us compute the ECE in each _arrondissement_.
+
+
+For convenience, let us wrap the code from @sec-calib-comparison-7th in a function, so that we can compute the ECE for a given _arrondissement_.
+```{r define-compute_ece_arrondissement}
+#' Computes ECE for a single arrondissement, depending on the neighbors distance
+#' 
+#' @param arrond name od the arrondissement
+#' @param k number of neighbors to consider
+#' @param obs_name name of the variable with observed values in the data
+#' @param pred_name name of the variable with predicted values in the data
+#' @param data dataset to use
+compute_ece_arrondissement <- function(arrond, 
+                                       k, 
+                                       obs_name = "pm2", 
+                                       pred_name = "pm2_estimated",
+                                       data) {
+  data_current <- data |> filter(NOM_COM == !!arrond)
+  obs <- data_current |> pull(!!obs_name)
+  pred <- data_current |> pull(!!pred_name)
+  ece <- calculate_ece(
+    obs = obs, 
+    pred = pred,
+    k = k
+  )
+  ece
+}
+```
+
+
+We just need to loop over the names of the different _arrondissements_ to calculate the expected calibration errors.
+```{r}
+name_arronds <- unique(data_clean_all$NOM_COM)
+name_arronds <- name_arronds[!is.na(name_arronds)]
+ece_arrond <- map_dbl(
+  .x = name_arronds,
+  .f = ~compute_ece_arrondissement(
+    arrond = .x, 
+    k = 5, 
+    obs_name = "pm2", 
+    pred_name = "pm2_estimated",
+    data = data_clean_all
+  )
+)
+```
+
+
+Let us put the values in a tibble:
+```{r define-ece_arrond_tb}
+ece_arrond_tb <- tibble(
+  arrondissement = name_arronds,
+  ece = ece_arrond
+) |> 
+  mutate(
+    arrondissement = factor(
+      arrondissement, 
+      levels = str_c(
+        "Paris ", 1:20, "e", c("r", rep("", 19)), " Arrondissement")
+    )
+  ) |> 
+  arrange(arrondissement)
+```
+
+
+We can save this for later use (in @sec-fairness-eo-arrond in [Chapter -@sec-fairness]).
+```{r save-ece_arrond_tb}
+save(ece_arrond_tb, file = "../data/ece_arrond_tb.rda")
+```
+
+
+The values are reported in @tbl-ece-arrond.
+```{r}
+#| tbl-cap: Expected Calibration Error per _Arrondissement_.
+#| label: tbl-ece-arrond
+#| code-fold: true
+#| code-summary: Display the codes used to create the Table
+
+knitr::kable(
+  ece_arrond_tb,
+    booktabs = TRUE, digits = 3,
+    col.names = c("Arrondissement", "ECE")
+  )
+```
+
+
+## Focus on Montmartre and Champs-de-Mars {#sec-calib-mont-champ}
+
+
+Let us now focus on two IRIS: Montmartre and Champs-de-Mars. We will compute the ECE for these two IRIS, varying the number of neighbors used to aggregate data.
+
+In @sec-spatial-price-smoothing from [Chapter -@sec-neighborhood-based-smoothing], we computed the minimum distance from one iris to another, considering distances up to 30. We will also need this information.
+```{r load-neighbours_all, message=FALSE, warning=FALSE}
+neighbours_all <- read_csv('../data/neighbours/all_neighbours_paris.csv')
+```
+
+Let us define a function, `compute_ece_iris_neighbors()`{.R} that computes the ECE for a given IRIS code, using the neighborhood up to a certain degree.
+
+```{r define-compute_ece_iris_neighbors}
+#' Computes ECE for a single IRIS, depending on the neighbors distance
+#' 
+#' @param iris_code IRIS identifier
+#' @param k number of bins
+#' @param num_neigh distance of neighbors to include
+#' @param obs_name name of the variable with observed values in the data
+#' @param pred_name name of the variable with predicted values in the data
+#' @param data dataset to use
+compute_ece_iris_neighbors <- function(iris_code, 
+                                       k, 
+                                       num_neigh,
+                                       obs_name = "pm2", 
+                                       pred_name = "pm2_estimated",
+                                       data,
+                                       neighbors_dist) {
+  
+  want_iris <- 
+    neighbors_dist |> 
+    filter(from_iris == iris_code) |> 
+    filter(distance <= num_neigh) |> 
+    pull(to_iris) |> 
+    unique()
+  
+  data_current <- data |> filter(CODE_IRIS %in% !!want_iris)
+  obs <- data_current |> pull(!!obs_name)
+  pred <- data_current |> pull(!!pred_name)
+  ece <- calculate_ece(
+    obs = obs, 
+    pred = pred,
+    k = k
+  )
+  ece
+}
+
+
+```
+
+Let us apply this function to Montmartre and Champs-de-Mars, and let us make the maximum distance of neighbors to include vary from 1 to 9 in steps of 1. For Montmartre:
+```{r define-ece_montmartre_neigh}
+ece_montmartre_neigh <- map_dbl(
+  .x = 1:9,
+  .f = ~compute_ece_iris_neighbors(
+    iris_code = "751093503", 
+    k = 5,
+    num_neigh = .x, 
+    obs_name = "pm2",
+    pred_name = "pm2_estimated", 
+    data = data_clean_all, 
+    neighbors_dist = neighbours_all
+  )
+)
+```
+
+And for Champs-de-Mars:
+```{r define-ece_champ_neigh}
+ece_champ_neigh <- map_dbl(
+  .x = 1:9,
+  .f = ~compute_ece_iris_neighbors(
+    iris_code = "751072812", 
+    k = 5,
+    num_neigh = .x, 
+    obs_name = "pm2",
+    pred_name = "pm2_estimated", 
+    data = data_clean_all, 
+    neighbors_dist = neighbours_all
+  )
+)
+```
+
+Let us put the results into two tibbles:
+```{r define-ece_neighbours_montmartre}
+ece_neighbours_montmartre <- tibble(
+  neighbours = 1:9,
+  ece = ece_montmartre_neigh,
+  iris_name = "Montmartre"
+) 
+
+ece_neighbours_mars <- tibble(
+  neighbours = 1:9,
+  ece = ece_champ_neigh,
+  iris_name = "Champs-de-Mars"
+)
+```
+
+And save the results for later use (in @sec-fairness-viz-iris in [Chapter -@sec-fairness]).
+```{r}
+save(ece_neighbours_montmartre, file = "../data/ece_neighbours_montmartre.rda")
+save(ece_neighbours_mars, file = "../data/ece_neighbours_mars.rda")
+```
+
+
+The values are reported in @tbl-ece-mont-champ.
+```{r}
+#| tbl-cap: Expected Calibration Error in Montmartre and Champs-de-Mars depending on the number of neighbors considered to compute the metric.
+#| label: tbl-ece-mont-champ
+#| code-fold: true
+#| code-summary: Display the codes used to create the Table
+ece_neighbours_montmartre |> 
+  bind_rows(ece_neighbours_mars) |> 
+  pivot_wider(names_from = iris_name, values_from = ece) |> 
+  rename(Neighbors = neighbours) |> 
+  knitr::kable(
+    booktabs = TRUE, digit = 3
+  )
+```
+
+

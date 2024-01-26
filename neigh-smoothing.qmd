@@ -1,0 +1,964 @@
+# Neighborhood-Based Smoothing {#sec-neighborhood-based-smoothing}
+
+```{r setup, message=FALSE, warning=FALSE}
+#| code-fold: true
+#| code-summary: Display the setting codes
+
+# Required packages----
+library(tidyverse)
+library(lubridate)
+library(gtsummary)
+library(labelled)
+library(sf)
+library(showtext)
+library(extrafont)
+library(wesanderson)
+
+# Graphs----
+font_main = font_title = 'Times New Roman'
+extrafont::loadfonts(quiet = T)
+face_text='plain'
+face_title='plain'
+size_title = 14
+size_text = 11
+legend_size = 11
+
+global_theme <- function() {
+  theme_minimal() %+replace%
+    theme(
+      text = element_text(family = font_main, size = size_text, face = face_text),
+      legend.text = element_text(family = font_main, size = legend_size),
+      axis.text = element_text(size = size_text, face = face_text), 
+      plot.title = element_text(
+        family = font_title, 
+        size = size_title, 
+        hjust = 0.5
+      ),
+      plot.subtitle = element_text(hjust = 0.5)
+    )
+}
+
+# Colours
+colors_ <- wes_palette('Rushmore1')
+col_seine <- "#2140A3"
+```
+
+The spatial information of the properties is given at the IRIS level. However, in some IRIS, as shown in @fig-map-nb-obs-iris, there are no observations. We will therefore use a spatial smoothing to impute values in all IRIS.
+
+## Load Data
+
+
+Let us load the data obtained in [Chapter -@sec-data].
+```{r}
+# Real Estate
+load("../data/data_clean_all.rda")
+# Maps files
+load("../data/shapes.rda")
+```
+
+
+```{r}
+#| fig-cap: "Number of observation per IRIS."
+#| label: fig-map-nb-obs-iris
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure
+shapes_paris |> 
+  left_join(
+    data_clean_all |> 
+      group_by(CODE_IRIS) |> 
+      summarise(
+        total_observations = n(), 
+        median_price = median(contract_final_net_price)
+      ),
+    by = "CODE_IRIS"
+  ) %>% 
+  replace_na(list(total_observations = 0)) |> 
+  ggplot() + 
+  geom_sf(aes(fill = total_observations)) + 
+  scale_fill_gradientn(
+    colours = rev(terrain.colors(10)), 
+    name = 'No. Observations', 
+    position = 'bottom'
+    ) +
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme()
+```
+
+
+## Defining Neighbors
+
+
+The size of the area of each IRIS differs considerably. Hence, smoothing the observation by simply defining higher levels by Euclidean distance from a given point might pose problems, as it could include many dense but heterogeneous regions on one end of the spectrum or only a few on the other. Instead, we will define a **neighborhood graph** (see the paper for a formal definition).
+
+We will hereafter denote $i$ and $j$ the polygons of the ith and jth IRIS, respectively.
+
+The neighborhood graph can be represented by an $n\times n$ matrix named an adjacency matrix, denoted $A$.If regions $i$ and $j$ intersect, $A_{i,j}=1$, and $A_{i,j}=0$ otherwise. Representing neighborhood relations using an adjacency matrix has the advantage that non-intermediate connections can be easily obtained by successively multiplying the adjacency matrix by itself. That is, all nonzero elements of $A^2$ represent neighborhoods that are either immediately adjacent to a given region (the direct neighbors) or are adjacent to the direct neighbors (the neighbors of the direct neighbors). This process can be repeated $n$ times to obtain neighbors that can be reached within an $n$ length path. This provides a more natural way to define neighborhoods, as with each increasing path length, an entire homogeneous region is added to the higher-level aggregation. 
+
+Let us construct a neighborhood graphs with R, using {igraph}.
+
+```{r library-igraph, message = FALSE, warning=FALSE}
+library(igraph)
+```
+
+Here we need the Seine River as well. Otherwise, we cannot find neighbors.
+```{r define-shapes_all}
+shapes_all <- 
+  shapes_paris |> 
+  bind_rows(shapes_seine)
+```
+
+Let us get the first level:
+```{r}
+shapes_neighbours_export <- st_intersects(shapes_all, shapes_all)
+```
+
+The $A_1$ adjacency matrix can then be constructed. We initialize it with 0s.
+```{r define-adj_matrix_lev_1}
+adj_matrix_lev_1 <- matrix(
+  nrow = length(shapes_neighbours_export), 
+  ncol = length(shapes_neighbours_export), 
+  0
+)
+```
+
+
+Then, we loop over all polygons and change the value of $A_1(i,j)$ to 1 if regions $i$ and $j$ are neighbors:
+```{r populate-adjacency-matrix-1}
+row_index <- 1
+for (item in shapes_neighbours_export) {
+  for (col_idx in item) {
+    adj_matrix_lev_1[row_index, col_idx] = 1
+  }
+  row_index <- row_index + 1
+}
+```
+
+Then, by multiplying this square matrix by itself, we can obtain the neighbors and the neighbors of neighbors:
+```{r}
+adj_matrix_lev_2 <- adj_matrix_lev_1 %*% adj_matrix_lev_1
+adj_matrix_lev_2[which(adj_matrix_lev_2 > 0)] <- 1
+```
+
+
+Let us focus on a particular IRIS and visualize it and its neighbors on a map. We will produce three maps: one which only shows the particular IRIS, another one which also its immediate neighbors, and a third one which shows the neighbors immediately adjacent or adjacent to the direct neighbor.
+
+```{r define-target_community}
+target_community <- "Enfants Rouges 4"
+```
+
+
+The map with the single target IRIS:
+```{r define-shapes_neighbours}
+single_munip <- 
+  shapes_paris %>% 
+  rowid_to_column('index_ids') |> 
+  filter(grepl('Paris', NOM_COM)) |> 
+  mutate(
+    Classification = if_else(
+      NOM_IRIS == target_community,
+      'target community',
+      'others')
+  ) |> 
+  mutate(
+    Classification = factor(
+      Classification,
+      levels=c('target community', 'neighbours', 'others')
+    )
+  ) |> 
+  ggplot() + 
+  geom_sf(aes(fill = Classification)) + 
+  scale_fill_manual(
+    values = c(colors_[c(3)], '#D21F3C', colors_[c(1)]), 
+    limits = c('target community', 'neighbours', 'others'), 
+    name = ''
+  ) + 
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme() + 
+  theme(legend.position = "bottom")
+```
+
+The map with the immediate neighbors:
+```{r define-one_neigh}
+one_neigh <- shapes_paris |> 
+  rowid_to_column('index_ids') |> 
+  filter(grepl('Paris', NOM_COM)) |> 
+  mutate(
+    Classification = if_else(
+      index_ids %in% which(
+        adj_matrix_lev_1[which(shapes_paris$NOM_IRIS == target_community),] == 1
+        ),
+      'neighbours', 'others')
+  ) |> 
+  mutate(
+    Classification = if_else(
+      index_ids == which(shapes_paris$NOM_IRIS == target_community), 
+      'target community', Classification
+    )
+  ) |> 
+  mutate(
+    Classification = factor(
+      Classification,
+      levels=c('target community', 'neighbours', 'others')
+    )
+  ) |> 
+  ggplot() + 
+  geom_sf(aes(fill = Classification)) + 
+  scale_fill_manual(values = c(colors_[c(3)], '#D21F3C', colors_[c(1)])) + 
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme()
+```
+
+Lastly, the third map with the both immediate neighbors and neighbors of neighbors:
+```{r}
+two_neigh <- 
+  shapes_paris |> 
+  rowid_to_column('index_ids') |> 
+  filter(grepl('Paris', NOM_COM)) |> 
+  mutate(
+    Classification = if_else(
+      index_ids %in% which(
+        adj_matrix_lev_2[which(shapes_paris$NOM_IRIS == target_community),] > 0
+      ),
+      'neighbours', 
+      'others'
+    )
+  )|> 
+  mutate(
+    Classification = if_else(
+      index_ids == which(shapes_paris$NOM_IRIS == target_community), 
+      'target community', 
+      Classification
+    )
+  ) |> 
+  mutate(
+    Classification = factor(
+      Classification,
+      levels=c('target community', 'neighbours', 'others')
+    )
+  ) |> 
+  ggplot() + 
+  geom_sf(aes(fill = Classification)) + 
+  scale_fill_manual(values = c(colors_[c(3)], '#D21F3C', colors_[c(1)])) + 
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme()
+```
+
+@fig-map-neighbourhood illustrates how the neighborhood set for a particular IRIS community can be calculated. 
+
+
+```{r}
+#| fig-cap: "A sampled IRIS region within Paris (left pane) and its immediate adjacent neighbors (center pane) and the second level neighbors (right pane). The Seine River is depicted in blue whereas all other regions are depicted in yellow."
+#| label: fig-map-neighbourhood
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure
+#| fig-height: 2.5
+#| fig-width: 8
+
+p_example_neigh_row <- cowplot::plot_grid(
+  single_munip + theme(legend.position="none"),
+  one_neigh + theme(legend.position="none"),
+  two_neigh + theme(legend.position="none"),
+  align = 'vh',
+  ncol = 3
+)
+p_example_neigh_legend <- cowplot::get_legend(single_munip)
+
+p_example_neigh <- cowplot::plot_grid(
+  p_example_neigh_row, p_example_neigh_legend, 
+  ncol = 1, rel_heights = c(1, .2)
+)
+p_example_neigh
+```
+
+
+
+## Spatial Price Smoothing {#sec-spatial-price-smoothing}
+
+
+For a given variable observed at IRIS level $x$, the smoothed value for region $r_i$, denoted as $\lambda_\omega(x_i)$ can be written as:
+
+$$\begin{align}
+\lambda_{\omega}(x_i) = \frac{1}{\sum_{j=1}^{n} {\omega}(r_i,r_j)}\sum_{j=1}^n {\omega}(r_i,r_j) x_i \enspace.     
+\end{align}
+$$ {#eq-lambda-omega}
+For example, let $d(r_i, r_j)$ be the path length between regions $r_i$ and $r_j$, then a simple way to define $\omega(r_i,r_j)$ is:
+$$
+\begin{align}\label{eq:weights}
+    \omega(r_i,r_j)=
+        \begin{cases}
+        \frac{1}{(1+d(r_i,r_j))^p},\quad & \text{if } d(i,j) \leq m \\
+        0, & \text{otherwise} \enspace,
+        \end{cases}
+\end{align}
+$${#eq-omega-ri-rj}
+where $p$ and $m$ are hyperparameters to be selected, similar to the bandwidth operator. 
+
+
+
+We initiate the neighborhood matrix by putting the values we just computed:
+```{r define-neigh_matrix}
+neigh_matrix <- adj_matrix_lev_1
+```
+
+Then, we can increase the neighborhood distance $m$ so that it takes values from 2 to 30 in steps of 1. This allows us to get each IRIS which are distant from one another by a value lower or equal to $m$.
+```{r loop-m-neighborhood-matrix, eval = FALSE}
+# dir.create("../data/neighbours/all_neighbour_levels")
+# cli::cli_progress_bar(total = length(seq(2,30)))
+for (neigh_idst in seq(2,30)) {
+  # Set neighbors
+  adj_matrix_next_level <- neigh_matrix %*% adj_matrix_lev_1
+  adj_matrix_next_level[which(adj_matrix_next_level > 0)] <- 1
+  
+  # Create Graph 
+  graph_tmp <- graph_from_adjacency_matrix(adj_matrix_next_level)
+  export_string <- paste(
+    '../data/neighbours/all_neighbour_levels/neighbours_level_',
+    neigh_idst,
+    '.csv', 
+    sep=''
+  )
+  
+  graph_tmp |> 
+    as_data_frame() |> 
+    mutate(access = neigh_idst) |> 
+    write_csv(export_string)
+  
+  # Reset and restart
+  neigh_matrix <- adj_matrix_next_level
+  # cli::cli_progress_update(set = which(neigh_idst == seq(2,30)))
+}
+```
+
+
+We also export a tibble with a mapping between each IRIS and its row number in `shapes_all`.
+```{r define-mapping_neighbours}
+mapping_neighbours <- 
+  shapes_all |> 
+  rowid_to_column('index_ids') |> 
+  select(index_ids, CODE_IRIS) |> 
+  as_tibble() |> 
+  select(-c(geometry))
+
+mapping_neighbours |> 
+  write_csv('../data/neighbours/mapping_neighbour_id_iris.csv')
+```
+
+
+Now that we have obtained the adjacency matrices from $m=\{1, 2, \ldots, 30\}$, we can create a tibble which will contain the distance from each polygon to all the other polygons (provided the maximum distance is lower or equal to 30).
+
+We first populate the desired object, `all_neighbours` with all the IRIS which have a distance equal to 1:
+```{r define-all_neighbours}
+all_neighbours <- 
+  graph_from_adjacency_matrix(adj_matrix_lev_1) |> 
+  as_data_frame() |> 
+  tibble() |> 
+  mutate(access = 1)
+all_neighbours
+```
+
+Then, let us add, step by step, the IRIS which are neighbors with a distance lower or equal to 2, then to 3, and so on, until 30.
+```{r loop-load-neighbour-levels, eval=FALSE, message = FALSE, warning=FALSE}
+for (neigh_idst in seq(2,30)) {
+  read_string <- paste(
+    '../data/neighbours/all_neighbour_levels/neighbours_level_',
+    neigh_idst,
+    '.csv', 
+    sep = ''
+  )
+  
+  neighbor_level <- read_csv(read_string, progress = FALSE)
+  
+  # Add neighbors at current distance
+  all_neighbours <- 
+    all_neighbours |> 
+    bind_rows(neighbor_level)
+}
+```
+
+Now, we would like to extract from the resulting object, the minimum distance from one IRIS to another, for all IRIS.
+
+```{r define-min_distances, eval=FALSE}
+neighbours_all <- all_neighbours |>
+  group_by(from, to) |> 
+  summarise(min_distance = min(access), .groups = "drop") |> 
+  left_join(
+    mapping_neighbours, 
+    by = c('from' = 'index_ids')
+  ) |> 
+  left_join(
+    mapping_neighbours, 
+    by = c('to' = 'index_ids')
+  ) |> 
+  select(
+    from_iris = CODE_IRIS.x, 
+    to_iris = CODE_IRIS.y, 
+    distance = min_distance
+  )
+```
+
+The result can be saved:
+```{r save-min_distances, eval=FALSE}
+neighbours_all |> 
+  write_csv('../data/neighbours/all_neighbours_paris.csv')
+```
+
+```{r load-min_distances, echo=FALSE, message=FALSE, warning=FALSE}
+neighbours_all <- read_csv('../data/neighbours/all_neighbours_paris.csv')
+```
+
+
+```{r neighbours_all-char-from-to}
+neighbours_all <- 
+  neighbours_all |> 
+  mutate(
+    from_iris = as.character(from_iris),
+    to_iris = as.character(to_iris)
+  )
+```
+
+Here is the resulting matrix:
+```{r display-neighbours_all}
+neighbours_all
+```
+
+
+Let us compute the average selling price in each IRIS:
+```{r define-data_immo_agg}
+data_immo_agg <- 
+  data_clean_all |> 
+  group_by(CODE_IRIS) |> 
+  summarise(mean_sale_price = mean(pm2))
+```
+
+
+Let us use this to plot the observed prices per square meter, on a choropleth map. We will display the unsmoothed version on the left and the smoothed version on the right. The smoothed version is computed using @eq-lambda-omega. We will use here a distance $m=5$.
+```{r define-smooth_prices}
+m <- 5
+
+smooth_prices <- 
+  neighbours_all |> 
+  mutate(distance = distance + 1) |> 
+  mutate(distance = if_else(from_iris == to_iris, 1, distance)) |> 
+  filter(distance <= !!m) |> 
+  left_join(
+    data_immo_agg, 
+    by = c('to_iris' = 'CODE_IRIS')
+  ) |> 
+  mutate(inverse_weight = 1 / distance) |> 
+  mutate(weighted_val = mean_sale_price * inverse_weight) |> 
+  drop_na()  |> 
+  group_by(from_iris) |> 
+  summarise(
+    total_weights = sum(inverse_weight), 
+    total_val = sum(weighted_val)
+  ) |> 
+  mutate(smoothed_val = total_val / total_weights) |> 
+  ungroup() |> 
+  mutate(CODE_IRIS = from_iris) |> 
+  select(CODE_IRIS, smoothed_price = smoothed_val)
+```
+
+
+```{r create-plots-smooth-prices}
+#| code-fold: true
+#| code-summary: Display the codes to create the Figure
+
+# Unsmoothed version
+p_1 <- 
+  shapes_paris |> 
+  left_join(
+    data_clean_all |> 
+      group_by(CODE_IRIS) |> 
+      summarise(
+        total_observations = n(), 
+        median_price = mean(pm2), 
+        std_price = sd(contract_final_net_price)
+      ),
+    by = "CODE_IRIS"
+  ) |> 
+  replace_na(list(total_observations = 0)) |> 
+  ggplot() + 
+  geom_sf(aes(fill = median_price)) + 
+  scale_fill_gradientn(
+    colours = rev(terrain.colors(10)), 
+    limits = c(5000,20000),
+    name = 'Median Price', 
+    position = 'bottom') +
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme() + 
+  guides(
+    fill = guide_colorbar(
+      title = "Mean prices per IRIS",
+      position = 'bottom',
+      title.position = "top", 
+      title.vjust = 0,
+      # draw border around the legend
+      frame.colour = "black",
+      barwidth = 10,
+      barheight = 1.5
+    )
+  )
+
+# Smoothed version
+p_2 <- 
+  shapes_paris |> 
+  left_join(smooth_prices, by = "CODE_IRIS") |> 
+  ggplot() + 
+  geom_sf(aes(fill = smoothed_price)) + 
+  scale_fill_gradientn(
+    colours = rev(terrain.colors(10)), 
+    position = 'bottom', 
+    labels = scales::comma
+  ) +
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme()
+```
+
+::: {.panel-tabset}
+
+
+```{r child-map-smooth-prices-distance}
+#| output: asis
+#| echo: false
+m_val <- c(3, 5, 10)
+res <- purrr::map_chr(m_val, \(current_m) {
+    knitr::knit_child(
+      input = "figs-children/map-smooth-prices.qmd", 
+      envir = environment(), 
+      quiet = TRUE
+      )
+  })
+
+cat(res, sep = '\n')
+```
+
+:::
+
+First, we compute the median observed price in each IRIS of the dataset, using the raw values. Then, we add the smoothed prices computed earlier (using $m=$ `r m`), for each IRIS. Then, we aggregate the values at the _arrondissement_ level (column `NOM_COM` in the map data): we compute the average of the median IRIS prices and the average of the smoothed version.
+
+
+```{r define-data_smooth_arrond}
+data_smooth_arrond <- 
+  data_clean_all |> 
+  mutate(CODE_IRIS = as.character(iris_cog)) |> 
+  group_by(CODE_IRIS) |> 
+  summarise(
+    median_qmp = median(pm2)
+  ) |> 
+  left_join(
+    smooth_prices |> 
+      mutate(smoothed_qmp = smoothed_price),
+    by = "CODE_IRIS"
+  ) |> 
+  left_join(
+    shapes_paris |> 
+      as_tibble() |> 
+      select(CODE_IRIS, NOM_COM),
+    by = "CODE_IRIS"
+  ) |> 
+  group_by(NOM_COM) |> 
+  summarise(
+    median_qmp = mean(median_qmp), 
+    smoothed_qmp = mean(smoothed_qmp),
+    .groups = "drop"
+  )
+```
+
+The values are reported in @tbl-obs-prices-arrond.
+
+```{r}
+#| tbl-cap: Aggregated observed prices at the _arrondissement_ level.
+#| label: tbl-obs-prices-arrond
+#| code-fold: true
+#| code-summary: Display the codes used to create the Table
+data_smooth_arrond |> 
+  mutate(
+    NOM_COM = factor(
+      NOM_COM, 
+      levels = str_c(
+        "Paris ", 1:20, "e", c("r", rep("", 19)), " Arrondissement")
+    )
+  ) |> 
+  arrange(NOM_COM) |> 
+  knitr::kable(
+    booktabs = TRUE, 
+    col.names = c("Arrondissement", "Average of Median", "Average of Smooth")
+  )
+```
+
+Let us now visualize these values on two choropleth map, one for each aggregated method (@fig-re-aggregated).
+
+```{r}
+#| fig-cap: "Re-Aggregated data, left pane, mean per _arrondissement_ when the raw, un-smoothed data is used to calculate the average price per square meter of real estate. Right pane, results when the neighbor-smoothed estimates are used."
+#| label: fig-re-aggregated
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure
+p_1 <- shapes_paris |> 
+  group_by(NOM_COM) |> 
+  summarise(
+    arrond_shape = st_combine(geometry)
+  ) |> 
+  left_join(data_smooth_arrond, by = "NOM_COM") |> 
+  ggplot() + 
+  geom_sf(aes(fill = median_qmp)) + 
+  scale_fill_gradientn(
+    colours = rev(terrain.colors(10)), 
+    limits = c(5000, 15000),
+    name = 'Price', 
+    position = 'bottom', 
+    labels = scales::comma
+  ) +
+  geom_sf(
+    data = shapes_seine, 
+          fill = col_seine
+  ) + 
+  ggtitle('Aggregated Raw') + 
+  global_theme() + 
+  guides(
+    fill = guide_colorbar(
+      title = "Mean prices per Arrondissement",
+      position='bottom',
+      title.position = "top", title.vjust = 0,
+      frame.colour = "black",
+      barwidth = 15,
+      barheight = 1.5
+    )
+  )
+
+p_2 <- shapes_paris |> 
+   group_by(NOM_COM) |> 
+   summarise(
+     arrond_shape = st_combine(geometry)
+   ) |> 
+   left_join(data_smooth_arrond, by = "NOM_COM") |> 
+   ggplot() + 
+   geom_sf(aes(fill = smoothed_qmp)) + 
+  scale_fill_gradientn(
+    colours = rev(terrain.colors(10)), 
+    limits = c(5000, 15000),
+    name = 'Price', 
+    position = 'bottom', 
+    labels = scales::comma
+  ) +
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  ggtitle('Aggregated Smoothed') + 
+  global_theme()
+
+ggpubr::ggarrange(
+  p_1, p_2, 
+  ncol = 2,nrow = 1,
+  legend = "bottom", 
+  common.legend = TRUE
+)
+```
+
+## Relative Errors in Prices {#sec-spatial-rel-error}
+
+Let us dig into the relative error between estimated prices and observed ones. First, we compute the mean relative difference between the observed and the estimated price, per IRIS.
+The is computed as follows
+$$\frac{z - \hat{z}}{z}$$
+```{r define-diffs_smooth}
+diffs_smooth <- 
+  data_clean_all |> 
+  filter(pm2 < 20000) |> 
+  filter(pm2_estimated < 20000) |> 
+  select(CODE_IRIS, pm2, difference_pm2) |> 
+  mutate(relative_error = difference_pm2/pm2) |> 
+  group_by(CODE_IRIS) |>  
+  summarise(
+    mean_relative_diff = mean(relative_error), 
+    median_relative_diff = median(relative_error),
+    .groups = "drop"
+  )
+```
+
+There are two outliers, so we decide to trim the data.
+```{r trim-diffs_smooth}
+cuts_ <- quantile(diffs_smooth$mean_relative_diff, c(0.02,0.98))
+diffs_smooth <- 
+  diffs_smooth |> 
+  filter(mean_relative_diff > cuts_[1]) |> 
+  filter(mean_relative_diff < cuts_[2])
+```
+
+We use @eq-lambda-omega to compute the smoothed values, using $m=$ `r m`.
+```{r define-smoothed_diff}
+smoothed_diff <- 
+  neighbours_all |> 
+  mutate(distance = distance + 1) |> 
+  filter(distance <= !!m) |> 
+  mutate(distance = if_else(from_iris == to_iris, 1, distance)) |> 
+  left_join(
+    diffs_smooth, 
+    by = c('to_iris'='CODE_IRIS')
+  ) |> 
+  mutate(inverse_weight = 1 / distance) |> 
+  mutate(value = mean_relative_diff * inverse_weight^2) |> 
+  drop_na() |> 
+  group_by(from_iris) |> 
+  summarise(
+    total_weights = sum(inverse_weight), 
+    total_value = sum(value)
+  ) |> 
+  mutate(smoothed_diff = total_value / total_weights) |> 
+  ungroup() |> 
+  mutate(CODE_IRIS = from_iris, smoothed_diff)
+```
+
+Before plotting the map with the values, we isolate some regions of interest that will be plotted on the maps as well and used as examples in paper.
+
+1. two IRIS: Montmartre and Champs-de-Mars.
+2. two _arrondissements_: the 12th and the 20th.
+
+```{r define-shape_champs}
+shape_champs <- 
+  shapes_paris |> 
+  filter(CODE_IRIS == '751072812')
+
+shape_mont <- 
+  shapes_paris|> 
+  filter(CODE_IRIS == '751093503')
+
+shape_12 <- 
+  shapes_paris |> 
+  filter(NOM_COM == 'Paris 12e Arrondissement') |> 
+  summarise(shape = st_union(geometry))
+
+shape_20 <- 
+  shapes_paris |> 
+  filter(NOM_COM == 'Paris 20e Arrondissement') |> 
+  summarise(shape = st_union(geometry))
+```
+
+The relative errors per IRIS are shown in @fig-smoothed-diffs.
+
+```{r}
+#| fig-cap: "Relative estimation error per $m^2$ in different sub-regions. The values are smoothed across spatial neighbors to emphasize the spatial correlation."
+#| label: fig-smoothed-diffs
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure
+scale_val <- seq(
+  min(smoothed_diff$smoothed_diff), 
+  max(smoothed_diff$smoothed_diff), 
+  length.out = 4
+)
+p <- shapes_paris |> 
+  left_join(smoothed_diff, by = "CODE_IRIS") |> 
+  ggplot() + 
+  geom_sf(aes(fill = smoothed_diff)) + 
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  geom_sf(
+    data = shape_champs, 
+    color = 'black', 
+    fill = alpha('white', 0),
+    lwd = 1, 
+    lty = 'solid'
+  ) + 
+  geom_sf(
+    data = shape_mont, 
+    color = 'black', 
+    lwd = 1, 
+    fill = alpha('white', 0),
+    lty = 'solid'
+  ) + 
+  geom_sf(
+    data = shape_12, 
+    color = 'black', 
+    lwd = 1, 
+    fill = alpha('white', 0),
+    lty = 'dashed'
+  ) + 
+  geom_sf(
+    data = shape_20, 
+    color = 'black', 
+    lwd = 1, 
+    fill = alpha('white', 0),
+    lty = 'dashed'
+  ) + 
+  global_theme() + 
+  scale_fill_gradient2(
+    NULL,
+    midpoint = 0,
+    high = "#000090",
+    mid = "white",
+    low = "#CD3700",
+    breaks = scale_val,
+    labels = scales::percent(scale_val)
+  ) + 
+  theme(
+    legend.position = 'bottom'
+  ) +
+  ggtitle('Smoothed relative error')
+
+panel_width <- unit(1,"npc") - sum(ggplotGrob(p)[["widths"]][-3])
+p + guides(fill = guide_colorbar(barwidth = panel_width/2))
+```
+
+
+
+## Number of observation per IRIS {#sec-spatial-n-smooth}
+
+
+Let us also show the number of observation, using the smoothed values. First, we smooth the number of observation in each IRIS:
+```{r define-smooth_n}
+smooth_n <- 
+  neighbours_all |> 
+  mutate(distance = distance + 1) |> 
+  mutate(distance = if_else(from_iris == to_iris, 1, distance)) |> 
+  filter(distance <= !!m) |> 
+  left_join(
+    data_clean_all |> count(CODE_IRIS, name = "n"),
+    by = c('to_iris' = 'CODE_IRIS')
+  ) |> 
+  mutate(inverse_weight = 1 / distance) |> 
+  mutate(weighted_val = n * inverse_weight) |> 
+  drop_na()  |> 
+  group_by(from_iris) |> 
+  summarise(
+    total_weights = sum(inverse_weight), 
+    total_val = sum(weighted_val)
+  ) |> 
+  mutate(smoothed_n = total_val / total_weights) |> 
+  ungroup() |> 
+  mutate(CODE_IRIS = from_iris) |> 
+  select(CODE_IRIS, smoothed_n = smoothed_n)
+```
+
+Then, we can plot the result (@fig-smooth-obs-plot).
+
+```{r}
+#| fig-cap: "Number of available observations, smoothed using the neighborhood method."
+#| label: fig-smooth-obs-plot
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure
+shapes_paris |> 
+  left_join(smooth_n, by = "CODE_IRIS") |> 
+  ggplot() + 
+  geom_sf(aes(fill = smoothed_n)) + 
+  scale_fill_gradientn(
+    colours = rev(terrain.colors(10)), 
+    name = 'No. Observations', 
+    position = 'bottom'
+  ) +
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme()
+```
+
+
+## Wealth Level per IRIS {#sec-neigh-wealth-iris}
+
+Let us have a look at the wealth level per IRIS, using the smoothed version. 
+
+We load the income data per IRIS (see @sec-data-wealth in [Chapter -@sec-data]):
+```{r load-data_income, warning=FALSE, message=FALSE}
+data_income <- read_delim(
+  str_c(
+    "../data/econ/", 
+    "BASE_TD_FILO_DISP_IRIS_2020_CSV/BASE_TD_FILO_DISP_IRIS_2020.csv"
+  ),
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+```
+
+The data needs to be formatted to match with the other files used here.
+```{r define-median_inc_data}
+median_inc_data <- 
+  data_income |> 
+  select(CODE_IRIS = IRIS, DISP_MED20) |> 
+  mutate(DISP_MED20 = as.numeric(DISP_MED20))
+```
+
+We can compute the smoothed values per IRIS.
+```{r define-smoothed_income}
+smoothed_income <- 
+  neighbours_all |> 
+  mutate(distance = distance + 1) |> 
+  mutate(distance = if_else(from_iris == to_iris, 1, distance)) |> 
+  filter(distance <= !!m) |> 
+  left_join(
+    mapping_neighbours, 
+    by=c('to_iris' = 'CODE_IRIS')
+  ) |> 
+  mutate(CODE_IRIS = as.character(to_iris)) |> 
+  left_join(
+    median_inc_data, 
+    by = 'CODE_IRIS'
+  ) |> 
+  mutate(inverse_weight = 1 / distance) |> 
+  mutate(weighted_inc = DISP_MED20 * inverse_weight) |> 
+  drop_na() |> 
+  group_by(from_iris) |> 
+  summarise(
+    total_weights = sum(inverse_weight), 
+    total_inc = sum(weighted_inc)
+  ) |> 
+  mutate(smoothed_inc = total_inc / total_weights) |> 
+  ungroup() |> 
+  mutate(CODE_IRIS = from_iris) |> 
+  select(CODE_IRIS, smoothed_income = smoothed_inc)
+```
+
+Then, we can plot the result (@fig-smooth-income).
+
+```{r}
+#| fig-cap: "Estimated Income per IRIS region, smoothed using the neighborhood method."
+#| label: fig-smooth-income
+#| code-fold: true
+#| code-summary: Display the codes used to create the Figure
+shapes_paris |> 
+  left_join(smoothed_income, by = "CODE_IRIS") |> 
+  ggplot() + 
+  geom_sf(aes(fill = smoothed_income)) + 
+  scale_fill_gradientn(
+    colours = rev(terrain.colors(10)), 
+    labels = scales::comma
+  ) +
+  geom_sf(
+    data = shapes_seine, 
+    fill = col_seine
+  ) + 
+  global_theme() +
+  theme(legend.position = "bottom") +
+  guides(
+    fill = guide_colorbar(
+      title = "Smoothed Median Income per IRIS",
+      position='bottom',
+      title.position = "top", 
+      title.vjust = 0,
+      frame.colour = "black",
+      barwidth = 15,
+      barheight = 1.5
+    )
+  )
+```
+
+
