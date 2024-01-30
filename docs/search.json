@@ -4,7 +4,7 @@
     "href": "index.html",
     "title": "Geospatial Disparities: A Case Study on Real Estate Prices in Paris",
     "section": "",
-    "text": "Introduction\nThis ebook provides the replication codes to the article titled ‘Geospatial Disparities: A Case Study on Real Estate Prices in Paris.’\nThe ebook is divided in 5 chapters. In Chapter 1, we present the datasets used in the article along with some descriptive statistics. In Chapter 2, we show are we can proceed to spatially smooth geospatial data. In Chapter 3, we present how to visualize the calibration and how to compute the expected calibration error. In Chapter 4, we show spatial disparities in terms of fairness. Lastly, in Chapter 5, we present strategies to mitigate the biases highlighted in the previous chapters."
+    "text": "Introduction\nThis ebook provides the replication codes to the article titled ‘Geospatial Disparities: A Case Study on Real Estate Prices in Paris.’\nThe working paper is available on arXiv: https://arxiv.org/abs/2401.16197.\nThe ebook is divided in 5 chapters. In Chapter 1, we present the datasets used in the article along with some descriptive statistics. In Chapter 2, we show are we can proceed to spatially smooth geospatial data. In Chapter 3, we present how to visualize the calibration and how to compute the expected calibration error. In Chapter 4, we show spatial disparities in terms of fairness. Lastly, in Chapter 5, we present strategies to mitigate the biases highlighted in the previous chapters."
   },
   {
     "objectID": "index.html#abstract-of-the-article",

@@ -2,6 +2,8 @@
 
 This ebook provides the replication codes to the article titled _'Geospatial Disparities: A Case Study on Real Estate Prices in Paris.'_
 
+The working paper is available on arXiv: <https://arxiv.org/abs/2401.16197>.
+
 The ebook is divided in 5 chapters. In [Chapter -@sec-data], we present the datasets used in the article along with some descriptive statistics. In [Chapter -@sec-neighborhood-based-smoothing], we show are we can proceed to spatially smooth geospatial data. In [Chapter -@sec-model-calibration], we present how to visualize the calibration and how to compute the expected calibration error. In [Chapter -@sec-fairness], we show spatial disparities in terms of fairness. Lastly, in [Chapter -@sec-mitigation], we present strategies to mitigate the biases highlighted in the previous chapters.
 
 
